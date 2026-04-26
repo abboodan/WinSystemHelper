@@ -72,8 +72,10 @@ public sealed class Worker : BackgroundService
     private readonly IHostApplicationLifetime _hostLifetime;
     private readonly SemaphoreSlim _resumeNotificationLock = new(1, 1);
     private readonly SemaphoreSlim _micRecordingLock = new(1, 1);
+    private readonly object _micLoopSync = new();
     private readonly CancellationTokenSource _serviceStopping = new();
     private readonly Stopwatch _uptime = Stopwatch.StartNew();
+    private CancellationTokenSource? _micLoopCts;
 
     public Worker(
         ILogger<Worker> logger,
@@ -97,6 +99,7 @@ public sealed class Worker : BackgroundService
 
     public override Task StopAsync(CancellationToken cancellationToken)
     {
+        CancelMicLoop();
         _serviceStopping.Cancel();
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         return base.StopAsync(cancellationToken);
@@ -273,7 +276,7 @@ public sealed class Worker : BackgroundService
                 await TriggerAlarmAsync(cancellationToken);
                 break;
             case "/mic":
-                await StartMicAlarmRecordingAsync(text, cancellationToken);
+                await HandleMicCommandAsync(text, cancellationToken);
                 break;
             case "/stop":
                 await StopServiceAsync(cancellationToken);
@@ -310,6 +313,8 @@ public sealed class Worker : BackgroundService
             "/ip - Show the current public IP address.",
             "/alarm - Play a system alert sound.",
             "/mic [seconds] - Trigger an overt alarm and record audio for up to 60 seconds.",
+            "/mic [seconds] loop - Start a persistent overt active alarm loop.",
+            "/mic stop - Stop the persistent active alarm loop.",
             "/help - Show this command list.",
             "/stop - Stop the WinSystemHelper service.",
             "/uninstall - Stop and delete the WinSystemHelper service.");
@@ -355,9 +360,7 @@ public sealed class Worker : BackgroundService
     {
         try
         {
-            StartProcessInActiveUserSession(
-                GetWindowsPowerShellPath(),
-                "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"[console]::beep(3000, 3000)\"");
+            TriggerPowerShellBeep();
 
             await SendTelegramMessageOnceAsync("🚨 Scare alarm triggered via PowerShell!", cancellationToken);
         }
@@ -370,9 +373,27 @@ public sealed class Worker : BackgroundService
         }
     }
 
-    private async Task StartMicAlarmRecordingAsync(string commandText, CancellationToken cancellationToken)
+    private async Task HandleMicCommandAsync(string commandText, CancellationToken cancellationToken)
     {
-        int durationSeconds = ParseMicDurationSeconds(commandText);
+        MicCommand micCommand = ParseMicCommand(commandText);
+
+        if (micCommand.Stop)
+        {
+            await StopMicAlarmLoopAsync(cancellationToken);
+            return;
+        }
+
+        if (micCommand.Loop)
+        {
+            await StartMicAlarmLoopAsync(micCommand.DurationSeconds, cancellationToken);
+            return;
+        }
+
+        await StartMicAlarmRecordingAsync(micCommand.DurationSeconds, cancellationToken);
+    }
+
+    private async Task StartMicAlarmRecordingAsync(int durationSeconds, CancellationToken cancellationToken)
+    {
 
         if (!await _micRecordingLock.WaitAsync(0, cancellationToken))
         {
@@ -391,18 +412,133 @@ public sealed class Worker : BackgroundService
             _serviceStopping.Token);
     }
 
-    private async Task RecordAndSendMicAlarmAsync(int durationSeconds, CancellationToken cancellationToken)
+    private async Task StartMicAlarmLoopAsync(int durationSeconds, CancellationToken cancellationToken)
     {
-        string? tempFile = null;
+        CancellationTokenSource? loopCts = null;
 
-        if (!await _micRecordingLock.WaitAsync(0, cancellationToken))
+        lock (_micLoopSync)
         {
+            if (_micLoopCts is null)
+            {
+                loopCts = CancellationTokenSource.CreateLinkedTokenSource(_serviceStopping.Token);
+                _micLoopCts = loopCts;
+            }
+        }
+
+        if (loopCts is null)
+        {
+            await SendTelegramMessageOnceAsync(
+                "⚠️ Active Alarm loop is already running! Send /mic stop first.",
+                cancellationToken);
             return;
         }
 
         try
         {
+            await SendTelegramMessageOnceAsync(
+                $"🎤 Persistent Active Alarm loop started ({durationSeconds}s cycles).",
+                cancellationToken);
+
+            _ = Task.Run(
+                () => RunMicAlarmLoopAsync(durationSeconds, loopCts),
+                CancellationToken.None);
+        }
+        catch
+        {
+            lock (_micLoopSync)
+            {
+                if (ReferenceEquals(_micLoopCts, loopCts))
+                {
+                    _micLoopCts = null;
+                }
+            }
+
+            loopCts.Cancel();
+            loopCts.Dispose();
+            throw;
+        }
+    }
+
+    private async Task StopMicAlarmLoopAsync(CancellationToken cancellationToken)
+    {
+        CancelMicLoop();
+
+        await SendTelegramMessageOnceAsync(
+            "🛑 Persistent Active Alarm stopped.",
+            cancellationToken);
+    }
+
+    private async Task RunMicAlarmLoopAsync(int durationSeconds, CancellationTokenSource loopCts)
+    {
+        try
+        {
+            while (!loopCts.Token.IsCancellationRequested)
+            {
+                try
+                {
+                    bool cycleCompleted = await RecordAndSendMicAlarmAsync(durationSeconds, loopCts.Token);
+                    if (!cycleCompleted)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(2), loopCts.Token);
+                    }
+                }
+                catch (OperationCanceledException) when (loopCts.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Persistent active alarm loop cycle failed.");
+
+                    try
+                    {
+                        await SendTelegramMessageOnceAsync(
+                            $"⚠️ Persistent Active Alarm cycle failed: {ex.Message}",
+                            CancellationToken.None);
+                    }
+                    catch (Exception sendException)
+                    {
+                        _logger.LogWarning(sendException, "Failed to report persistent active alarm loop failure.");
+                    }
+
+                    try
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(2), loopCts.Token);
+                    }
+                    catch (OperationCanceledException) when (loopCts.IsCancellationRequested)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            lock (_micLoopSync)
+            {
+                if (ReferenceEquals(_micLoopCts, loopCts))
+                {
+                    _micLoopCts = null;
+                }
+            }
+
+            loopCts.Dispose();
+        }
+    }
+
+    private async Task<bool> RecordAndSendMicAlarmAsync(int durationSeconds, CancellationToken cancellationToken)
+    {
+        string? tempFile = null;
+
+        if (!await _micRecordingLock.WaitAsync(0, cancellationToken))
+        {
+            return false;
+        }
+
+        try
+        {
             TriggerOvertRecordingWarnings();
+            TriggerPowerShellBeep();
 
             tempFile = Path.Combine(
                 GetSharedAudioTempDirectory(),
@@ -420,9 +556,12 @@ public sealed class Worker : BackgroundService
                 duration: durationSeconds,
                 caption: $"🎤 Active Alarm recording ({durationSeconds}s).",
                 cancellationToken: timeout.Token);
+
+            return true;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            return false;
         }
         catch (Exception ex)
         {
@@ -430,6 +569,8 @@ public sealed class Worker : BackgroundService
             await SendTelegramMessageOnceAsync(
                 $"⚠️ Active Alarm recording failed: {ex.Message}",
                 CancellationToken.None);
+
+            return false;
         }
         finally
         {
@@ -449,16 +590,32 @@ public sealed class Worker : BackgroundService
         }
     }
 
-    private static int ParseMicDurationSeconds(string commandText)
+    private static MicCommand ParseMicCommand(string commandText)
     {
         string[] parts = commandText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var durationSeconds = DefaultMicRecordingSeconds;
+        var loop = false;
 
-        if (parts.Length < 2 || !int.TryParse(parts[1], out int requestedSeconds))
+        foreach (string part in parts.Skip(1))
         {
-            return DefaultMicRecordingSeconds;
+            if (part.Equals("stop", StringComparison.OrdinalIgnoreCase))
+            {
+                return new MicCommand(durationSeconds, Loop: false, Stop: true);
+            }
+
+            if (part.Equals("loop", StringComparison.OrdinalIgnoreCase))
+            {
+                loop = true;
+                continue;
+            }
+
+            if (int.TryParse(part, out int requestedSeconds))
+            {
+                durationSeconds = Math.Clamp(requestedSeconds, 1, MaxMicRecordingSeconds);
+            }
         }
 
-        return Math.Clamp(requestedSeconds, 1, MaxMicRecordingSeconds);
+        return new MicCommand(durationSeconds, loop, Stop: false);
     }
 
     private static void TriggerOvertRecordingWarnings()
@@ -470,6 +627,13 @@ public sealed class Worker : BackgroundService
         StartProcessInActiveUserSession(
             GetWindowsPowerShellPath(),
             "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"(New-Object -ComObject SAPI.SpVoice).Speak('Security alert. Audio recording activated.')\"");
+    }
+
+    private static void TriggerPowerShellBeep()
+    {
+        StartProcessInActiveUserSession(
+            GetWindowsPowerShellPath(),
+            "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"[console]::beep(3000, 3000)\"");
     }
 
     private static async Task RunMicRecorderHelperAsync(
@@ -510,6 +674,17 @@ public sealed class Worker : BackgroundService
 
         Directory.CreateDirectory(directory);
         return directory;
+    }
+
+    private CancellationTokenSource? CancelMicLoop()
+    {
+        lock (_micLoopSync)
+        {
+            CancellationTokenSource? loopCts = _micLoopCts;
+            _micLoopCts = null;
+            loopCts?.Cancel();
+            return loopCts;
+        }
     }
 
     private async Task StopServiceAsync(CancellationToken cancellationToken)
@@ -952,6 +1127,8 @@ public sealed class Worker : BackgroundService
         return TimeSpan.FromMilliseconds(Math.Min(delayMilliseconds, maxDelay.TotalMilliseconds));
     }
 
+    private readonly record struct MicCommand(int DurationSeconds, bool Loop, bool Stop);
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct StartupInfo
     {
@@ -987,9 +1164,11 @@ public sealed class Worker : BackgroundService
     public override void Dispose()
     {
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        CancelMicLoop();
         _serviceStopping.Cancel();
         _serviceStopping.Dispose();
         _resumeNotificationLock.Dispose();
+        _micRecordingLock.Dispose();
         base.Dispose();
     }
 }
