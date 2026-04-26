@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Security.Principal;
 using System.Text.Json;
+using NAudio.Wave;
 using Telegram.Bot;
 using WinSystemHelper;
 
@@ -17,6 +18,11 @@ async Task<int> RunAsync(string[] launchArgs)
 {
     try
     {
+        if (IsMicRecorderHelperMode(launchArgs))
+        {
+            return await RunMicRecorderHelperAsync(launchArgs);
+        }
+
         if (launchArgs.Length > 0)
         {
             return await RunSilentCliModeAsync(launchArgs);
@@ -248,6 +254,93 @@ AppConfiguration LoadConfiguration()
     }
 
     return configuration;
+}
+
+static bool IsMicRecorderHelperMode(string[] launchArgs)
+{
+    return launchArgs.Length > 0 &&
+        launchArgs[0].TrimStart('/', '-').Equals("recordmic-helper", StringComparison.OrdinalIgnoreCase);
+}
+
+static async Task<int> RunMicRecorderHelperAsync(string[] launchArgs)
+{
+    int seconds = 10;
+    string? outputPath = null;
+
+    for (int i = 1; i < launchArgs.Length; i++)
+    {
+        if (TryReadOptionValue(launchArgs[i], "seconds", launchArgs, ref i, out string? secondsText) &&
+            int.TryParse(secondsText, out int parsedSeconds))
+        {
+            seconds = Math.Clamp(parsedSeconds, 1, 60);
+            continue;
+        }
+
+        if (TryReadOptionValue(launchArgs[i], "out", launchArgs, ref i, out string? parsedOutputPath))
+        {
+            outputPath = parsedOutputPath;
+        }
+    }
+
+    if (string.IsNullOrWhiteSpace(outputPath))
+    {
+        return 2;
+    }
+
+    Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+    await RecordWavAsync(outputPath, seconds, CancellationToken.None);
+
+    return 0;
+}
+
+static async Task RecordWavAsync(
+    string outputPath,
+    int durationSeconds,
+    CancellationToken cancellationToken)
+{
+    TaskCompletionSource<Exception?> recordingStopped =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    using WaveInEvent waveIn = new()
+    {
+        WaveFormat = new WaveFormat(16000, 16, 1),
+        BufferMilliseconds = 100
+    };
+
+    await using WaveFileWriter writer = new(outputPath, waveIn.WaveFormat);
+
+    waveIn.DataAvailable += (_, e) =>
+    {
+        if (e.BytesRecorded > 0)
+        {
+            writer.Write(e.Buffer, 0, e.BytesRecorded);
+            writer.Flush();
+        }
+    };
+
+    waveIn.RecordingStopped += (_, e) =>
+    {
+        recordingStopped.TrySetResult(e.Exception);
+    };
+
+    waveIn.StartRecording();
+
+    try
+    {
+        await Task.Delay(TimeSpan.FromSeconds(durationSeconds), cancellationToken);
+    }
+    finally
+    {
+        waveIn.StopRecording();
+    }
+
+    Exception? recordingException =
+        await recordingStopped.Task.WaitAsync(TimeSpan.FromSeconds(5), CancellationToken.None);
+
+    if (recordingException is not null)
+    {
+        throw recordingException;
+    }
 }
 
 static bool EnsureAdministrator()

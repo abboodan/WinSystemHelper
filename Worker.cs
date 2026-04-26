@@ -22,9 +22,13 @@ public sealed class Worker : BackgroundService
     private static readonly Uri TelegramApiBaseUri = new("https://api.telegram.org");
     private static readonly Uri PublicIpUri = new("https://api.ipify.org");
     private const int TelegramUpdateLimit = 20;
+    private const int DefaultMicRecordingSeconds = 10;
+    private const int MaxMicRecordingSeconds = 60;
     private const uint CreateNoWindow = 0x08000000;
     private const uint CreateUnicodeEnvironment = 0x00000400;
     private const uint ActiveConsoleSessionUnavailable = 0xFFFFFFFF;
+    private const uint WaitObject0 = 0x00000000;
+    private const uint WaitTimeout = 0x00000102;
 
     [DllImport("kernel32.dll")]
     private static extern uint WTSGetActiveConsoleSessionId();
@@ -55,12 +59,19 @@ public sealed class Worker : BackgroundService
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+
     private readonly ILogger<Worker> _logger;
     private readonly AppConfiguration _configuration;
     private readonly ITelegramBotClient _botClient;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IHostApplicationLifetime _hostLifetime;
     private readonly SemaphoreSlim _resumeNotificationLock = new(1, 1);
+    private readonly SemaphoreSlim _micRecordingLock = new(1, 1);
     private readonly CancellationTokenSource _serviceStopping = new();
     private readonly Stopwatch _uptime = Stopwatch.StartNew();
 
@@ -261,6 +272,9 @@ public sealed class Worker : BackgroundService
             case "/alarm":
                 await TriggerAlarmAsync(cancellationToken);
                 break;
+            case "/mic":
+                await StartMicAlarmRecordingAsync(text, cancellationToken);
+                break;
             case "/stop":
                 await StopServiceAsync(cancellationToken);
                 break;
@@ -295,6 +309,7 @@ public sealed class Worker : BackgroundService
             "/shutdown - Gracefully shut down the PC after 10 seconds.",
             "/ip - Show the current public IP address.",
             "/alarm - Play a system alert sound.",
+            "/mic [seconds] - Trigger an overt alarm and record audio for up to 60 seconds.",
             "/help - Show this command list.",
             "/stop - Stop the WinSystemHelper service.",
             "/uninstall - Stop and delete the WinSystemHelper service.");
@@ -353,6 +368,148 @@ public sealed class Worker : BackgroundService
                 $"⚠️ Alarm failed: {ex.Message}",
                 cancellationToken);
         }
+    }
+
+    private async Task StartMicAlarmRecordingAsync(string commandText, CancellationToken cancellationToken)
+    {
+        int durationSeconds = ParseMicDurationSeconds(commandText);
+
+        if (!await _micRecordingLock.WaitAsync(0, cancellationToken))
+        {
+            await SendTelegramMessageOnceAsync("🎤 Active Alarm recording is already running.", cancellationToken);
+            return;
+        }
+
+        _micRecordingLock.Release();
+
+        await SendTelegramMessageOnceAsync(
+            $"🎤 Active Alarm triggered. Scaring intruder and recording for {durationSeconds}s...",
+            cancellationToken);
+
+        _ = Task.Run(
+            () => RecordAndSendMicAlarmAsync(durationSeconds, _serviceStopping.Token),
+            _serviceStopping.Token);
+    }
+
+    private async Task RecordAndSendMicAlarmAsync(int durationSeconds, CancellationToken cancellationToken)
+    {
+        string? tempFile = null;
+
+        if (!await _micRecordingLock.WaitAsync(0, cancellationToken))
+        {
+            return;
+        }
+
+        try
+        {
+            TriggerOvertRecordingWarnings();
+
+            tempFile = Path.Combine(
+                GetSharedAudioTempDirectory(),
+                $"WinSystemHelper-active-alarm-{Guid.NewGuid():N}.wav");
+
+            await RunMicRecorderHelperAsync(tempFile, durationSeconds, cancellationToken);
+
+            await using FileStream voiceStream = File.OpenRead(tempFile);
+            using CancellationTokenSource timeout =
+                CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+
+            await _botClient.SendVoice(
+                chatId: _configuration.AdminChatId,
+                voice: InputFile.FromStream(voiceStream, "active-alarm.wav"),
+                duration: durationSeconds,
+                caption: $"🎤 Active Alarm recording ({durationSeconds}s).",
+                cancellationToken: timeout.Token);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Active alarm audio recording failed.");
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Active Alarm recording failed: {ex.Message}",
+                CancellationToken.None);
+        }
+        finally
+        {
+            _micRecordingLock.Release();
+
+            if (!string.IsNullOrWhiteSpace(tempFile) && File.Exists(tempFile))
+            {
+                try
+                {
+                    File.Delete(tempFile);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to delete temporary audio file {TempFile}.", tempFile);
+                }
+            }
+        }
+    }
+
+    private static int ParseMicDurationSeconds(string commandText)
+    {
+        string[] parts = commandText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (parts.Length < 2 || !int.TryParse(parts[1], out int requestedSeconds))
+        {
+            return DefaultMicRecordingSeconds;
+        }
+
+        return Math.Clamp(requestedSeconds, 1, MaxMicRecordingSeconds);
+    }
+
+    private static void TriggerOvertRecordingWarnings()
+    {
+        StartProcessInActiveUserSession(
+            "msg.exe",
+            "* \"🚨 SECURITY BREACH: Audio recording is now ACTIVE and being transmitted to the administrator.\"");
+
+        StartProcessInActiveUserSession(
+            GetWindowsPowerShellPath(),
+            "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"(New-Object -ComObject SAPI.SpVoice).Speak('Security alert. Audio recording activated.')\"");
+    }
+
+    private static async Task RunMicRecorderHelperAsync(
+        string outputPath,
+        int durationSeconds,
+        CancellationToken cancellationToken)
+    {
+        string commandLine = string.Join(
+            " ",
+            "/recordmic-helper",
+            $"/seconds {durationSeconds}",
+            $"/out \"{outputPath}\"");
+
+        uint exitCode = await StartProcessInActiveUserSessionAndWaitAsync(
+            GetCurrentExecutablePath(),
+            commandLine,
+            TimeSpan.FromSeconds(durationSeconds + 15),
+            cancellationToken);
+
+        if (exitCode != 0)
+        {
+            throw new InvalidOperationException($"Recorder helper exited with code {exitCode}.");
+        }
+
+        FileInfo outputFile = new(outputPath);
+        if (!outputFile.Exists || outputFile.Length == 0)
+        {
+            throw new InvalidOperationException("Recorder helper did not produce an audio file.");
+        }
+    }
+
+    private static string GetSharedAudioTempDirectory()
+    {
+        string directory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonDocuments),
+            "WinSystemHelper",
+            "Audio");
+
+        Directory.CreateDirectory(directory);
+        return directory;
     }
 
     private async Task StopServiceAsync(CancellationToken cancellationToken)
@@ -455,6 +612,7 @@ public sealed class Worker : BackgroundService
                     new BotCommand { Command = "shutdown", Description = "Shut down in 10 seconds" },
                     new BotCommand { Command = "ip", Description = "Show public IP address" },
                     new BotCommand { Command = "alarm", Description = "Play system alert sound" },
+                    new BotCommand { Command = "mic", Description = "Trigger overt alarm audio recording" },
                     new BotCommand { Command = "help", Description = "Show available commands" },
                     new BotCommand { Command = "stop", Description = "Stop the service" },
                     new BotCommand { Command = "uninstall", Description = "Stop and delete the service" }
@@ -550,6 +708,96 @@ public sealed class Worker : BackgroundService
         }
     }
 
+    private static async Task<uint> StartProcessInActiveUserSessionAndWaitAsync(
+        string fileName,
+        string arguments,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        uint sessionId = WTSGetActiveConsoleSessionId();
+        if (sessionId == ActiveConsoleSessionUnavailable)
+        {
+            throw new InvalidOperationException("No active console user session is available.");
+        }
+
+        if (!WTSQueryUserToken(sessionId, out IntPtr userToken))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to query the active user token.");
+        }
+
+        IntPtr environment = IntPtr.Zero;
+        ProcessInformation processInformation = default;
+
+        try
+        {
+            uint creationFlags = CreateNoWindow;
+            if (CreateEnvironmentBlock(out environment, userToken, inherit: false))
+            {
+                creationFlags |= CreateUnicodeEnvironment;
+            }
+
+            string executablePath = Path.IsPathRooted(fileName)
+                ? fileName
+                : Path.Combine(Environment.SystemDirectory, fileName);
+
+            string commandLine = $"\"{executablePath}\" {arguments}";
+            StartupInfo startupInfo = new()
+            {
+                cb = Marshal.SizeOf<StartupInfo>(),
+                lpDesktop = "winsta0\\default"
+            };
+
+            if (!CreateProcessAsUser(
+                    userToken,
+                    applicationName: null,
+                    commandLine: commandLine,
+                    processAttributes: IntPtr.Zero,
+                    threadAttributes: IntPtr.Zero,
+                    inheritHandles: false,
+                    creationFlags: creationFlags,
+                    environment: environment,
+                    currentDirectory: Path.GetDirectoryName(executablePath),
+                    startupInfo: ref startupInfo,
+                    processInformation: out processInformation))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to start process in the active user session.");
+            }
+
+            uint waitResult = await Task.Run(
+                () => WaitForSingleObject(processInformation.hProcess, (uint)timeout.TotalMilliseconds),
+                cancellationToken);
+
+            if (waitResult == WaitTimeout)
+            {
+                throw new TimeoutException("Recorder helper timed out.");
+            }
+
+            if (waitResult != WaitObject0)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed while waiting for recorder helper.");
+            }
+
+            if (!GetExitCodeProcess(processInformation.hProcess, out uint exitCode))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to read recorder helper exit code.");
+            }
+
+            return exitCode;
+        }
+        finally
+        {
+            CloseHandleIfNeeded(processInformation.hThread);
+            CloseHandleIfNeeded(processInformation.hProcess);
+
+            if (environment != IntPtr.Zero)
+            {
+                DestroyEnvironmentBlock(environment);
+            }
+
+            CloseHandleIfNeeded(userToken);
+        }
+    }
+
     private static string GetWindowsPowerShellPath()
     {
         string powerShellPath = Path.Combine(
@@ -564,6 +812,13 @@ public sealed class Worker : BackgroundService
         }
 
         return powerShellPath;
+    }
+
+    private static string GetCurrentExecutablePath()
+    {
+        return Environment.ProcessPath ??
+            Process.GetCurrentProcess().MainModule?.FileName ??
+            throw new InvalidOperationException("Unable to resolve executable path.");
     }
 
     private static void CloseHandleIfNeeded(IntPtr handle)
