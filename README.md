@@ -6,7 +6,8 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 
 - Hybrid self-installing executable with interactive setup, silent install, silent uninstall, and Windows Service modes.
 - Telegram Bot integration for authenticated remote administration.
-- Admin-only command handling using the configured Telegram chat ID.
+- Multi-admin command handling using the configured Telegram chat ID allowlist.
+- First-run setup wizard for interactive configuration when `config.json` is missing.
 - Startup and wake-from-sleep alerts.
 - Modern Standby-compatible wake detection through the Windows System event log.
 - Fail-fast Telegram configuration validation to avoid endless retries on invalid credentials.
@@ -21,7 +22,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 
 | Command | Description |
 | --- | --- |
-| `/status` | Shows machine, user, service uptime, network state, and timestamp. |
+| `/status` | Shows the full low-overhead system, runtime, service, battery, and wake watcher dashboard. |
 | `/lock` | Locks the active Windows workstation. |
 | `/shutdown` | Initiates a graceful shutdown after 10 seconds. |
 | `/restart` | Initiates a system restart after 10 seconds. |
@@ -34,6 +35,10 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/msg [text]` | Shows a warning message on the active user's screen. |
 | `/ask [text]` | Shows a Yes/No question and returns the user's answer. |
 | `/prompt [text]` | Forces a text response from the active user and returns it to Telegram. |
+| `/speak [text]` | Speaks a message through the active user session. |
+| `/screen` | Captures the active user's primary screen and returns the image. |
+| `/tasks` | Lists the top memory-consuming processes. |
+| `/kill [ProcessName]` | Terminates matching process instances by name. |
 | `/help` | Shows the available remote commands. |
 | `/stop` | Stops the WinSystemHelper service. |
 | `/uninstall` | Stops and deletes the WinSystemHelper service. |
@@ -54,25 +59,36 @@ bin\Release\net8.0-windows\win-x64\publish\
 
 ## Installation
 
-Run PowerShell or Command Prompt as Administrator, then install the service with your Telegram bot token and admin chat ID:
+Run PowerShell or Command Prompt as Administrator, then install the service with your Telegram bot token and primary admin chat ID:
 
 ```powershell
 WinSystemHelper.exe /install /token <YOUR_TOKEN> /chatid <YOUR_CHAT_ID>
 ```
 
-This writes `config.json` next to the executable, creates the `WinSystemHelper` Windows Service, and starts it automatically.
+This preserves the existing silent install flow, writes `config.json` next to the executable using the multi-admin format, creates the `WinSystemHelper` Windows Service, and starts it automatically.
+
+The generated configuration stores the provided chat ID as an array:
+
+```json
+{
+  "botToken": "<YOUR_TOKEN>",
+  "adminChatIds": [
+    987654321
+  ]
+}
+```
 
 ## Interactive Setup
 
-Run the executable without arguments from an elevated console:
+Run the executable without arguments from an elevated console on first run:
 
 ```powershell
 WinSystemHelper.exe
 ```
 
-If the service is not installed, the app prompts for your Telegram bot token and admin chat ID, saves them to `config.json`, installs the service, and starts it.
+If `config.json` is missing, the app starts the first-run setup wizard, prompts for your Telegram bot token, prompts for the primary admin chat ID, optionally accepts additional admin chat IDs, saves them to `config.json`, installs the service, and starts it.
 
-If the service is already installed, the app offers an uninstall option.
+If `config.json` already exists, the executable runs normally as the Worker Service host.
 
 ## Uninstall
 
@@ -91,6 +107,20 @@ config.json
 ```
 
 This file is intentionally excluded from Git. Do not commit bot tokens, chat IDs, appsettings files, logs, or local build output.
+
+The current configuration format supports multiple Telegram admins:
+
+```json
+{
+  "botToken": "<YOUR_TOKEN>",
+  "adminChatIds": [
+    111111111,
+    222222222
+  ]
+}
+```
+
+Older single-admin `adminChatId` configurations are still accepted for compatibility, but new installs and the setup wizard write `adminChatIds`.
 
 ## Security Disclaimer
 
