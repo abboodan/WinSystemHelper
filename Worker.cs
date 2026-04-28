@@ -23,6 +23,7 @@ public sealed class Worker : BackgroundService
     private static readonly TimeSpan ConnectivityProbeTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan AskPromptTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan TextPromptTimeout = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan ScreenshotTimeout = TimeSpan.FromSeconds(30);
     private static readonly Uri TelegramApiBaseUri = new("https://api.telegram.org");
     private static readonly Uri PublicIpUri = new("https://api.ipify.org");
     private const int TelegramUpdateLimit = 20;
@@ -38,6 +39,8 @@ public sealed class Worker : BackgroundService
     private const int TelegramForbiddenErrorCode = 403;
     private const uint AskYesExitCode = 1;
     private const uint AskNoExitCode = 2;
+    private const byte BatteryLifePercentUnknown = 255;
+    private const byte BatteryFlagNoSystemBattery = 128;
     private const string WakeEventLogName = "System";
     private const string WakeEventLogQuery =
         "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]";
@@ -80,16 +83,22 @@ public sealed class Worker : BackgroundService
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetSystemPowerStatus(out SystemPowerStatus systemPowerStatus);
+
     private readonly ILogger<Worker> _logger;
     private readonly AppConfiguration _configuration;
     private readonly ITelegramBotClient _botClient;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IHostApplicationLifetime _hostLifetime;
+    private readonly HashSet<long> _adminChatIds;
+    private readonly AsyncLocal<long?> _replyChatId = new();
     private readonly SemaphoreSlim _resumeNotificationLock = new(1, 1);
     private readonly SemaphoreSlim _micRecordingLock = new(1, 1);
     private readonly object _micLoopSync = new();
     private readonly object _wakeEventWatcherSync = new();
     private readonly CancellationTokenSource _serviceStopping = new();
+    private readonly DateTimeOffset _startedAt = DateTimeOffset.Now;
     private readonly Stopwatch _uptime = Stopwatch.StartNew();
     private CancellationTokenSource? _micLoopCts;
     private EventLogWatcher? _wakeEventWatcher;
@@ -107,6 +116,9 @@ public sealed class Worker : BackgroundService
         _botClient = botClient;
         _httpClientFactory = httpClientFactory;
         _hostLifetime = hostLifetime;
+        _adminChatIds = configuration.GetEffectiveAdminChatIds()
+            .Where(chatId => chatId != 0)
+            .ToHashSet();
     }
 
     public override Task StartAsync(CancellationToken cancellationToken)
@@ -200,10 +212,10 @@ public sealed class Worker : BackgroundService
 
     private async Task<bool> ValidateConfigurationOrStopAsync(CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(_configuration.BotToken) || _configuration.AdminChatId == 0)
+        if (string.IsNullOrWhiteSpace(_configuration.BotToken) || _adminChatIds.Count == 0)
         {
             _logger.LogCritical(
-                "Fatal configuration error: BotToken or AdminChatId is missing in config.json. The service will stop.");
+                "Fatal configuration error: BotToken or AdminChatIds is missing in config.json. The service will stop.");
             _hostLifetime.StopApplication();
             return false;
         }
@@ -219,16 +231,20 @@ public sealed class Worker : BackgroundService
                 CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
             User bot = await _botClient.GetMe(botTimeout.Token);
 
-            using CancellationTokenSource chatTimeout =
-                CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
-            await _botClient.GetChat(
-                chatId: _configuration.AdminChatId,
-                cancellationToken: chatTimeout.Token);
+            foreach (long adminChatId in _adminChatIds)
+            {
+                using CancellationTokenSource chatTimeout =
+                    CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+
+                await _botClient.GetChat(
+                    chatId: adminChatId,
+                    cancellationToken: chatTimeout.Token);
+            }
 
             _logger.LogInformation(
-                "Telegram configuration validated for bot @{BotUsername} and admin chat {AdminChatId}.",
+                "Telegram configuration validated for bot @{BotUsername} and {AdminChatCount} admin chat(s).",
                 bot.Username,
-                _configuration.AdminChatId);
+                _adminChatIds.Count);
 
             return true;
         }
@@ -264,7 +280,7 @@ public sealed class Worker : BackgroundService
         string userName = Environment.UserName;
         string timestamp = DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss zzz");
 
-        await SendTelegramMessageWithRetryAsync(
+        await SendTelegramBroadcastWithRetryAsync(
             $"🚀 Startup/Boot Alert: {machineName} booted up at {timestamp}. User: {userName}.",
             cancellationToken);
 
@@ -397,7 +413,7 @@ public sealed class Worker : BackgroundService
             string userName = Environment.UserName;
             string timestamp = DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss zzz");
 
-            await SendTelegramMessageWithRetryAsync(
+            await SendTelegramBroadcastWithRetryAsync(
                 $"🔔 Administrative alert: {machineName} resumed from sleep at {timestamp}. User: {userName}.",
                 cancellationToken);
 
@@ -417,7 +433,8 @@ public sealed class Worker : BackgroundService
         }
 
         // Security boundary: do not inspect or respond to commands from any non-admin chat.
-        if (message.Chat.Id != _configuration.AdminChatId)
+        long chatId = message.Chat.Id;
+        if (!_adminChatIds.Contains(chatId))
         {
             return;
         }
@@ -430,66 +447,193 @@ public sealed class Worker : BackgroundService
 
         string command = text.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0].ToLowerInvariant();
 
-        switch (command)
+        long? previousReplyChatId = _replyChatId.Value;
+        _replyChatId.Value = chatId;
+
+        try
         {
-            case "/start":
-            case "/help":
-                await SendHelpAsync(cancellationToken);
-                break;
-            case "/status":
-                await SendStatusAsync(cancellationToken);
-                break;
-            case "/lock":
-                await LockWorkstationAsync(cancellationToken);
-                break;
-            case "/shutdown":
-                await ShutdownAsync(cancellationToken);
-                break;
-            case "/restart":
-                await RestartAsync(cancellationToken);
-                break;
-            case "/sleep":
-                await SleepAsync(cancellationToken);
-                break;
-            case "/ip":
-                await SendPublicIpAsync(cancellationToken);
-                break;
-            case "/alarm":
-                await TriggerAlarmAsync(cancellationToken);
-                break;
-            case "/mic":
-                await HandleMicCommandAsync(text, cancellationToken);
-                break;
-            case "/msg":
-                await HandleScreenMessageCommandAsync(text, cancellationToken);
-                break;
-            case "/ask":
-                await HandleAskCommandAsync(text, cancellationToken);
-                break;
-            case "/prompt":
-                await HandlePromptCommandAsync(text, cancellationToken);
-                break;
-            case "/stop":
-                await StopServiceAsync(cancellationToken);
-                break;
-            case "/uninstall":
-                await UninstallServiceRemotelyAsync(cancellationToken);
-                break;
+            switch (command)
+            {
+                case "/start":
+                case "/help":
+                    await SendHelpAsync(cancellationToken);
+                    break;
+                case "/status":
+                    await SendStatusAsync(cancellationToken);
+                    break;
+                case "/lock":
+                    await LockWorkstationAsync(cancellationToken);
+                    break;
+                case "/shutdown":
+                    await ShutdownAsync(cancellationToken);
+                    break;
+                case "/restart":
+                    await RestartAsync(cancellationToken);
+                    break;
+                case "/sleep":
+                    await SleepAsync(cancellationToken);
+                    break;
+                case "/ip":
+                    await SendPublicIpAsync(cancellationToken);
+                    break;
+                case "/alarm":
+                    await TriggerAlarmAsync(cancellationToken);
+                    break;
+                case "/mic":
+                    await HandleMicCommandAsync(text, cancellationToken);
+                    break;
+                case "/msg":
+                    await HandleScreenMessageCommandAsync(text, cancellationToken);
+                    break;
+                case "/ask":
+                    await HandleAskCommandAsync(text, cancellationToken);
+                    break;
+                case "/prompt":
+                    await HandlePromptCommandAsync(text, cancellationToken);
+                    break;
+                case "/speak":
+                    await HandleSpeakCommandAsync(text, cancellationToken);
+                    break;
+                case "/screen":
+                    await HandleScreenshotCommandAsync(cancellationToken);
+                    break;
+                case "/tasks":
+                    HandleTasksCommand();
+                    break;
+                case "/kill":
+                    await HandleKillCommandAsync(text, cancellationToken);
+                    break;
+                case "/stop":
+                    await StopServiceAsync(cancellationToken);
+                    break;
+                case "/uninstall":
+                    await UninstallServiceRemotelyAsync(cancellationToken);
+                    break;
+            }
+        }
+        finally
+        {
+            _replyChatId.Value = previousReplyChatId;
         }
     }
 
     private async Task SendStatusAsync(CancellationToken cancellationToken)
     {
+        string processWorkingSet = "Unavailable";
+        string processThreadCount = "Unavailable";
+
+        try
+        {
+            using Process process = Process.GetCurrentProcess();
+            processWorkingSet = $"{process.WorkingSet64 / 1024d / 1024d:N1} MB";
+            processThreadCount = process.Threads.Count.ToString();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to collect current process metrics for status report.");
+        }
+
         string status = string.Join(
             Environment.NewLine,
-            "📊 WinSystemHelper status:",
-            $"Machine: {Environment.MachineName}",
-            $"User: {Environment.UserName}",
-            $"Service uptime: {_uptime.Elapsed:dd\\.hh\\:mm\\:ss}",
-            $"Network available: {NetworkInterface.GetIsNetworkAvailable()}",
+            "📊 WinSystemHelper Dashboard:",
+            "",
+            "🖥️ System & Hardware",
+            $"Machine: {SafeStatusMetric("machine name", () => Environment.MachineName)}",
+            $"OS: {SafeStatusMetric("OS version", () => Environment.OSVersion.VersionString)}",
+            $"Architecture: OS {SafeStatusMetric("OS architecture", () => RuntimeInformation.OSArchitecture.ToString())} | Process {SafeStatusMetric("process architecture", () => RuntimeInformation.ProcessArchitecture.ToString())}",
+            $"CPU cores: {SafeStatusMetric("CPU core count", () => Environment.ProcessorCount.ToString())}",
+            $"System uptime: {SafeStatusMetric("system uptime", () => FormatDuration(TimeSpan.FromMilliseconds(Environment.TickCount64)))}",
+            $"Battery: {SafeStatusMetric("battery status", GetBatteryStatusText)}",
+            "",
+            "⚙️ Process & Runtime",
+            $"Service PID: {Environment.ProcessId}",
+            $"Executable: {SafeStatusMetric("executable path", () => Environment.ProcessPath ?? "Unavailable")}",
+            $"Runtime: {SafeStatusMetric("runtime description", () => RuntimeInformation.FrameworkDescription)}",
+            $"Working set: {processWorkingSet}",
+            $"Managed memory: {SafeStatusMetric("managed memory", () => $"{GC.GetTotalMemory(forceFullCollection: false) / 1024d / 1024d:N1} MB")}",
+            $"GC collections: Gen0={SafeStatusMetric("GC Gen0", () => GC.CollectionCount(0).ToString())} | Gen1={SafeStatusMetric("GC Gen1", () => GC.CollectionCount(1).ToString())} | Gen2={SafeStatusMetric("GC Gen2", () => GC.CollectionCount(2).ToString())}",
+            $"Threads: {processThreadCount}",
+            "",
+            "📡 Service & State",
+            $"Started: {_startedAt:yyyy-MM-dd HH:mm:ss zzz}",
+            $"Service uptime: {FormatDuration(_uptime.Elapsed)}",
+            $"Network available: {SafeStatusMetric("network availability", () => NetworkInterface.GetIsNetworkAvailable().ToString())}",
+            $"Active console session: {SafeStatusMetric("active console session", GetActiveConsoleSessionStatus)}",
+            $"Wake watcher: {GetWakeWatcherStatus()}",
+            $"Mic loop: {GetMicLoopStatus()}",
             $"Timestamp: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
 
         await SendTelegramMessageOnceAsync(status, cancellationToken);
+    }
+
+    private string SafeStatusMetric(string metricName, Func<string> metricFactory)
+    {
+        try
+        {
+            return metricFactory();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to collect status metric {MetricName}.", metricName);
+            return "Unavailable";
+        }
+    }
+
+    private string GetBatteryStatusText()
+    {
+        if (!GetSystemPowerStatus(out SystemPowerStatus powerStatus))
+        {
+            _logger.LogDebug(
+                "Unable to read system power status. Win32 error code: {ErrorCode}.",
+                Marshal.GetLastWin32Error());
+            return "Unavailable";
+        }
+
+        if (powerStatus.BatteryLifePercent == BatteryLifePercentUnknown ||
+            (powerStatus.BatteryFlag & BatteryFlagNoSystemBattery) == BatteryFlagNoSystemBattery)
+        {
+            return "No system battery detected";
+        }
+
+        string status = powerStatus.ACLineStatus switch
+        {
+            0 => "Discharging",
+            1 => "Charging",
+            _ => "Unknown"
+        };
+
+        return $"{powerStatus.BatteryLifePercent}% | {status}";
+    }
+
+    private static string GetActiveConsoleSessionStatus()
+    {
+        uint sessionId = WTSGetActiveConsoleSessionId();
+        return sessionId == ActiveConsoleSessionUnavailable
+            ? "Unavailable"
+            : $"Available (Session {sessionId})";
+    }
+
+    private string GetWakeWatcherStatus()
+    {
+        lock (_wakeEventWatcherSync)
+        {
+            return _wakeEventWatcher is null ? "Unavailable" : "Registered";
+        }
+    }
+
+    private string GetMicLoopStatus()
+    {
+        lock (_micLoopSync)
+        {
+            return _micLoopCts is null ? "Inactive" : "Active";
+        }
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        return duration.TotalDays >= 1
+            ? duration.ToString(@"dd\.hh\:mm\:ss")
+            : duration.ToString(@"hh\:mm\:ss");
     }
 
     private async Task SendHelpAsync(CancellationToken cancellationToken)
@@ -511,6 +655,10 @@ public sealed class Worker : BackgroundService
             "/msg [text] - Show a warning message on the active user's screen.",
             "/ask [text] - Ask the active user a Yes/No question.",
             "/prompt [text] - Force a text response from the active user.",
+            "/speak [text] - 🗣️ Speak a message through the active session.",
+            "/screen - 🖼️ Capture and return the primary screen.",
+            "/tasks - 📋 Show the top 10 memory-consuming processes.",
+            "/kill [ProcessName] - 🔪 Terminate matching processes.",
             "/help - Show this command list.",
             "/stop - Stop the WinSystemHelper service.",
             "/uninstall - Stop and delete the WinSystemHelper service.");
@@ -629,6 +777,50 @@ public sealed class Worker : BackgroundService
             "Interactive text prompt failed.");
     }
 
+    private async Task HandleSpeakCommandAsync(string commandText, CancellationToken cancellationToken)
+    {
+        string message = GetCommandPayload(commandText);
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /speak [text]", cancellationToken);
+            return;
+        }
+
+        QueueBackgroundWork(
+            token => SpeakInActiveUserSessionAsync(message, token),
+            "Text-to-speech command failed.");
+    }
+
+    private Task HandleScreenshotCommandAsync(CancellationToken cancellationToken)
+    {
+        QueueBackgroundWork(
+            CaptureAndSendScreenshotAsync,
+            "Screenshot command failed.");
+
+        return Task.CompletedTask;
+    }
+
+    private void HandleTasksCommand()
+    {
+        QueueBackgroundWork(
+            SendTopProcessesAsync,
+            "Process list command failed.");
+    }
+
+    private async Task HandleKillCommandAsync(string commandText, CancellationToken cancellationToken)
+    {
+        string processName = GetCommandPayload(commandText);
+        if (string.IsNullOrWhiteSpace(processName))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /kill [ProcessName]", cancellationToken);
+            return;
+        }
+
+        QueueBackgroundWork(
+            token => KillProcessesByNameAsync(processName, token),
+            "Process kill command failed.");
+    }
+
     private static string GetCommandPayload(string commandText)
     {
         int separatorIndex = commandText.IndexOf(' ');
@@ -677,7 +869,7 @@ public sealed class Worker : BackgroundService
         }
         catch (TimeoutException)
         {
-            await SendTelegramMessageOnceAsync("⏳ User ignored the prompt (Timeout).", CancellationToken.None);
+            await SendTelegramBroadcastOnceAsync("⏳ User ignored the prompt (Timeout).", CancellationToken.None);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -696,7 +888,7 @@ public sealed class Worker : BackgroundService
         try
         {
             tempFile = Path.Combine(
-                GetSharedInteractionTempDirectory(),
+                GetSharedTempDirectory("Interaction"),
                 $"WinSystemHelper-prompt-{Guid.NewGuid():N}.txt");
 
             string script = BuildInputBoxScript(prompt, tempFile);
@@ -717,7 +909,7 @@ public sealed class Worker : BackgroundService
         }
         catch (TimeoutException)
         {
-            await SendTelegramMessageOnceAsync("⏳ User ignored the prompt (Timeout).", CancellationToken.None);
+            await SendTelegramBroadcastOnceAsync("⏳ User ignored the prompt (Timeout).", CancellationToken.None);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -729,20 +921,184 @@ public sealed class Worker : BackgroundService
         }
         finally
         {
-            if (!string.IsNullOrWhiteSpace(tempFile) && File.Exists(tempFile))
-            {
-                try
-                {
-                    File.Delete(tempFile);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to delete temporary prompt file {TempFile}.", tempFile);
-                }
-            }
+            DeleteTempFile(tempFile);
         }
     }
 
+    private async Task SpeakInActiveUserSessionAsync(string message, CancellationToken cancellationToken)
+    {
+        try
+        {
+            StartEncodedPowerShellInActiveUserSession(BuildSpeakScript(message));
+            await SendTelegramMessageOnceAsync("🗣️ Audio message played.", cancellationToken);
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
+        {
+            _logger.LogWarning(ex, "Text-to-speech command failed.");
+            await SendTelegramMessageOnceAsync($"⚠️ Speak command failed: {ex.Message}", CancellationToken.None);
+        }
+    }
+
+    private async Task CaptureAndSendScreenshotAsync(CancellationToken cancellationToken)
+    {
+        string? tempFile = null;
+
+        try
+        {
+            tempFile = Path.Combine(
+                GetSharedTempDirectory("Screen"),
+                $"WinSystemHelper-screen-{Guid.NewGuid():N}.jpg");
+
+            string script = BuildScreenshotScript(tempFile);
+
+            uint exitCode = await StartEncodedPowerShellInActiveUserSessionAndWaitAsync(
+                script,
+                ScreenshotTimeout,
+                cancellationToken);
+
+            if (exitCode != 0)
+            {
+                await SendTelegramMessageOnceAsync(
+                    $"⚠️ Screenshot capture failed. ExitCode: {exitCode}.",
+                    cancellationToken);
+                return;
+            }
+
+            FileInfo screenshotFile = new(tempFile);
+            if (!screenshotFile.Exists || screenshotFile.Length == 0)
+            {
+                await SendTelegramMessageOnceAsync("⚠️ Screenshot capture produced no image.", cancellationToken);
+                return;
+            }
+
+            await using FileStream photoStream = File.OpenRead(tempFile);
+            using CancellationTokenSource timeout =
+                CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+
+            await _botClient.SendPhoto(
+                chatId: GetReplyChatId(),
+                photo: InputFile.FromStream(photoStream, "screen.jpg"),
+                caption: $"🖼️ Screenshot captured at {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}.",
+                cancellationToken: timeout.Token);
+        }
+        catch (TimeoutException)
+        {
+            await SendTelegramMessageOnceAsync("⏳ Screenshot capture timed out.", CancellationToken.None);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Screenshot command failed.");
+            await SendTelegramMessageOnceAsync($"⚠️ Screenshot failed: {ex.Message}", CancellationToken.None);
+        }
+        finally
+        {
+            DeleteTempFile(tempFile);
+        }
+    }
+
+    private async Task SendTopProcessesAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            string[] lines = Process.GetProcesses()
+                .Select(process =>
+                {
+                    try
+                    {
+                        return new
+                        {
+                            process.ProcessName,
+                            process.Id,
+                            process.WorkingSet64
+                        };
+                    }
+                    catch
+                    {
+                        return null;
+                    }
+                    finally
+                    {
+                        process.Dispose();
+                    }
+                })
+                .Where(process => process is not null)
+                .OrderByDescending(process => process!.WorkingSet64)
+                .Take(10)
+                .Select((process, index) =>
+                    $"{index + 1}. {process!.ProcessName} | PID {process.Id} | {process.WorkingSet64 / 1024 / 1024:N0} MB")
+                .ToArray();
+
+            string message = string.Join(
+                Environment.NewLine,
+                ["📋 Top memory-consuming processes:", .. lines]);
+
+            await SendTelegramMessageOnceAsync(message, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Process list command failed.");
+            await SendTelegramMessageOnceAsync($"⚠️ Task list failed: {ex.Message}", CancellationToken.None);
+        }
+    }
+
+    private async Task KillProcessesByNameAsync(string requestedProcessName, CancellationToken cancellationToken)
+    {
+        string processName = NormalizeProcessName(requestedProcessName);
+        if (string.IsNullOrWhiteSpace(processName))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /kill [ProcessName]", cancellationToken);
+            return;
+        }
+
+        var matchedProcessCount = 0;
+        var terminatedProcessCount = 0;
+
+        foreach (Process process in Process.GetProcesses())
+        {
+            try
+            {
+                if (!process.ProcessName.Equals(processName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                matchedProcessCount++;
+                process.Kill();
+                terminatedProcessCount++;
+            }
+            catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or NotSupportedException)
+            {
+                _logger.LogWarning(ex, "Failed to terminate process {ProcessName}.", processName);
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+
+        if (matchedProcessCount == 0)
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Process {processName} not found.",
+                cancellationToken);
+            return;
+        }
+
+        if (terminatedProcessCount == 0)
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Process {processName} was found but could not be terminated.",
+                cancellationToken);
+            return;
+        }
+
+        await SendTelegramMessageOnceAsync(
+            $"🔪 Process {processName} terminated.",
+            cancellationToken);
+    }
     private async Task HandleMicCommandAsync(string commandText, CancellationToken cancellationToken)
     {
         MicCommand micCommand = ParseMicCommand(commandText);
@@ -911,7 +1267,7 @@ public sealed class Worker : BackgroundService
             TriggerPowerShellBeep();
 
             tempFile = Path.Combine(
-                GetSharedAudioTempDirectory(),
+                GetSharedTempDirectory("Audio"),
                 $"WinSystemHelper-active-alarm-{Guid.NewGuid():N}.wav");
 
             await RunMicRecorderHelperAsync(tempFile, durationSeconds, cancellationToken);
@@ -921,7 +1277,7 @@ public sealed class Worker : BackgroundService
                 CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
 
             await _botClient.SendVoice(
-                chatId: _configuration.AdminChatId,
+                chatId: GetReplyChatId(),
                 voice: InputFile.FromStream(voiceStream, "active-alarm.wav"),
                 duration: durationSeconds,
                 caption: $"🎤 Active Alarm recording ({durationSeconds}s).",
@@ -946,17 +1302,7 @@ public sealed class Worker : BackgroundService
         {
             _micRecordingLock.Release();
 
-            if (!string.IsNullOrWhiteSpace(tempFile) && File.Exists(tempFile))
-            {
-                try
-                {
-                    File.Delete(tempFile);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to delete temporary audio file {TempFile}.", tempFile);
-                }
-            }
+            DeleteTempFile(tempFile);
         }
     }
 
@@ -1078,9 +1424,112 @@ public sealed class Worker : BackgroundService
             """;
     }
 
+    private static string BuildSpeakScript(string message)
+    {
+        string encodedMessage = EncodeUtf8Base64(message);
+
+        return $$"""
+            $message = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{encodedMessage}}'))
+            (New-Object -ComObject SAPI.SpVoice).Speak($message) | Out-Null
+            exit 0
+            """;
+    }
+
+    private static string BuildScreenshotScript(string outputPath)
+    {
+        string encodedOutputPath = EncodeUtf8Base64(outputPath);
+
+        return $$"""
+            $ErrorActionPreference = 'Stop'
+
+            Add-Type -TypeDefinition @'
+            using System;
+            using System.Runtime.InteropServices;
+
+            public static class DpiNative {
+                [DllImport("user32.dll")]
+                public static extern bool SetProcessDPIAware();
+
+                [DllImport("shcore.dll")]
+                public static extern int SetProcessDpiAwareness(int value);
+
+                [DllImport("user32.dll")]
+                public static extern int GetSystemMetrics(int index);
+            }
+            '@
+
+            try {
+                [DpiNative]::SetProcessDpiAwareness(2) | Out-Null
+            }
+            catch {
+                [DpiNative]::SetProcessDPIAware() | Out-Null
+            }
+
+            Add-Type -AssemblyName System.Windows.Forms
+            Add-Type -AssemblyName System.Drawing
+
+            $outputPath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{encodedOutputPath}}'))
+            $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+            $bounds = $screen.Bounds
+            $width = [DpiNative]::GetSystemMetrics(0)
+            $height = [DpiNative]::GetSystemMetrics(1)
+
+            if ($width -le 0 -or $height -le 0) {
+                $width = $bounds.Width
+                $height = $bounds.Height
+            }
+
+            $bitmap = New-Object System.Drawing.Bitmap $width, $height
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+
+            try {
+                $graphics.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, (New-Object System.Drawing.Size $width, $height))
+                $bitmap.Save($outputPath, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                exit 0
+            }
+            catch {
+                exit 1
+            }
+            finally {
+                if ($null -ne $graphics) {
+                    $graphics.Dispose()
+                }
+
+                if ($null -ne $bitmap) {
+                    $bitmap.Dispose()
+                }
+            }
+            """;
+    }
+
     private static string EncodeUtf8Base64(string value)
     {
         return Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+    }
+
+    private static string NormalizeProcessName(string processName)
+    {
+        string normalized = processName.Trim();
+        return normalized.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            ? normalized[..^4]
+            : normalized;
+    }
+
+    private void DeleteTempFile(string? tempFile)
+    {
+        if (string.IsNullOrWhiteSpace(tempFile) || !File.Exists(tempFile))
+        {
+            return;
+        }
+
+        try
+        {
+            File.Delete(tempFile);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete temporary file {TempFile}.", tempFile);
+        }
     }
 
     private static async Task RunMicRecorderHelperAsync(
@@ -1112,23 +1561,12 @@ public sealed class Worker : BackgroundService
         }
     }
 
-    private static string GetSharedAudioTempDirectory()
+    private static string GetSharedTempDirectory(string purpose)
     {
         string directory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonDocuments),
             "WinSystemHelper",
-            "Audio");
-
-        Directory.CreateDirectory(directory);
-        return directory;
-    }
-
-    private static string GetSharedInteractionTempDirectory()
-    {
-        string directory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonDocuments),
-            "WinSystemHelper",
-            "Interaction");
+            purpose);
 
         Directory.CreateDirectory(directory);
         return directory;
@@ -1235,27 +1673,32 @@ public sealed class Worker : BackgroundService
     {
         try
         {
-            using CancellationTokenSource timeout =
-                CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+            BotCommand[] commands = BuildTelegramCommands();
 
-            await _botClient.SetMyCommands(
-                [
-                    new BotCommand { Command = "status", Description = "Show service status" },
-                    new BotCommand { Command = "lock", Description = "Lock the workstation" },
-                    new BotCommand { Command = "shutdown", Description = "Shut down in 10 seconds" },
-                    new BotCommand { Command = "restart", Description = "Restart the PC" },
-                    new BotCommand { Command = "sleep", Description = "Put the PC to sleep" },
-                    new BotCommand { Command = "ip", Description = "Show public IP address" },
-                    new BotCommand { Command = "alarm", Description = "Play system alert sound" },
-                    new BotCommand { Command = "mic", Description = "Trigger overt alarm audio recording" },
-                    new BotCommand { Command = "msg", Description = "Show a screen message" },
-                    new BotCommand { Command = "ask", Description = "Ask a Yes/No question" },
-                    new BotCommand { Command = "prompt", Description = "Request text input" },
-                    new BotCommand { Command = "help", Description = "Show available commands" },
-                    new BotCommand { Command = "stop", Description = "Stop the service" },
-                    new BotCommand { Command = "uninstall", Description = "Stop and delete the service" }
-                ],
-                cancellationToken: timeout.Token);
+            foreach (long adminChatId in _adminChatIds)
+            {
+                try
+                {
+                    using CancellationTokenSource timeout =
+                        CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+
+                    await _botClient.SetMyCommands(
+                        commands,
+                        scope: new BotCommandScopeChat { ChatId = adminChatId },
+                        cancellationToken: timeout.Token);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Failed to register Telegram command menu for admin chat {AdminChatId}.",
+                        adminChatId);
+                }
+            }
 
             _logger.LogInformation("Telegram command menu registered.");
         }
@@ -1267,6 +1710,31 @@ public sealed class Worker : BackgroundService
         {
             _logger.LogWarning(ex, "Failed to register Telegram command menu.");
         }
+    }
+
+    private static BotCommand[] BuildTelegramCommands()
+    {
+        return
+        [
+            new BotCommand { Command = "status", Description = "Show service status" },
+            new BotCommand { Command = "lock", Description = "Lock the workstation" },
+            new BotCommand { Command = "shutdown", Description = "Shut down in 10 seconds" },
+            new BotCommand { Command = "restart", Description = "Restart the PC" },
+            new BotCommand { Command = "sleep", Description = "Put the PC to sleep" },
+            new BotCommand { Command = "ip", Description = "Show public IP address" },
+            new BotCommand { Command = "alarm", Description = "Play system alert sound" },
+            new BotCommand { Command = "mic", Description = "Trigger overt alarm audio recording" },
+            new BotCommand { Command = "msg", Description = "Show a screen message" },
+            new BotCommand { Command = "ask", Description = "Ask a Yes/No question" },
+            new BotCommand { Command = "prompt", Description = "Request text input" },
+            new BotCommand { Command = "speak", Description = "Speak a message" },
+            new BotCommand { Command = "screen", Description = "Capture the screen" },
+            new BotCommand { Command = "tasks", Description = "Show top processes" },
+            new BotCommand { Command = "kill", Description = "Terminate a process" },
+            new BotCommand { Command = "help", Description = "Show available commands" },
+            new BotCommand { Command = "stop", Description = "Stop the service" },
+            new BotCommand { Command = "uninstall", Description = "Stop and delete the service" }
+        ];
     }
 
     private static void StartDetachedProcess(string fileName, string arguments)
@@ -1522,7 +1990,7 @@ public sealed class Worker : BackgroundService
         await Task.Delay(retryDelay, cancellationToken);
     }
 
-    private async Task SendTelegramMessageWithRetryAsync(
+    private async Task SendTelegramBroadcastWithRetryAsync(
         string text,
         CancellationToken cancellationToken)
     {
@@ -1534,8 +2002,12 @@ public sealed class Worker : BackgroundService
 
             try
             {
-                await SendTelegramMessageOnceAsync(text, cancellationToken);
-                return;
+                if (await SendTelegramBroadcastOnceAsync(text, cancellationToken))
+                {
+                    return;
+                }
+
+                throw new InvalidOperationException("Telegram broadcast failed for every configured admin chat.");
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -1555,7 +2027,7 @@ public sealed class Worker : BackgroundService
 
                 _logger.LogWarning(
                     ex,
-                    "Telegram message send failed on attempt {Attempt}. Retrying in {RetryDelay}.",
+                    "Telegram broadcast failed on attempt {Attempt}. Retrying in {RetryDelay}.",
                     attempt,
                     retryDelay);
 
@@ -1568,7 +2040,7 @@ public sealed class Worker : BackgroundService
     {
         _logger.LogCritical(
             exception,
-            "Fatal Telegram configuration error. ErrorCode: {ErrorCode}. Check BotToken and AdminChatId in config.json. The service will stop.",
+            "Fatal Telegram configuration error. ErrorCode: {ErrorCode}. Check BotToken and AdminChatIds in config.json. The service will stop.",
             exception.ErrorCode);
 
         _hostLifetime.StopApplication();
@@ -1590,9 +2062,50 @@ public sealed class Worker : BackgroundService
             CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
 
         await _botClient.SendMessage(
-            chatId: _configuration.AdminChatId,
+            chatId: GetReplyChatId(),
             text: text,
             cancellationToken: timeout.Token);
+    }
+
+    private async Task<bool> SendTelegramBroadcastOnceAsync(
+        string text,
+        CancellationToken cancellationToken)
+    {
+        var anyDelivered = false;
+
+        foreach (long adminChatId in _adminChatIds)
+        {
+            try
+            {
+                using CancellationTokenSource timeout =
+                    CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+
+                await _botClient.SendMessage(
+                    chatId: adminChatId,
+                    text: text,
+                    cancellationToken: timeout.Token);
+
+                anyDelivered = true;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Telegram broadcast delivery failed for admin chat {AdminChatId}.",
+                    adminChatId);
+            }
+        }
+
+        return anyDelivered;
+    }
+
+    private long GetReplyChatId()
+    {
+        return _replyChatId.Value ?? _adminChatIds.First();
     }
 
     private static CancellationTokenSource CreateTimeoutTokenSource(
@@ -1623,6 +2136,17 @@ public sealed class Worker : BackgroundService
     }
 
     private readonly record struct MicCommand(int DurationSeconds, bool Loop, bool Stop);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SystemPowerStatus
+    {
+        public byte ACLineStatus;
+        public byte BatteryFlag;
+        public byte BatteryLifePercent;
+        public byte SystemStatusFlag;
+        public int BatteryLifeTime;
+        public int BatteryFullLifeTime;
+    }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct StartupInfo

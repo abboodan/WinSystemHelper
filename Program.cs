@@ -28,9 +28,15 @@ async Task<int> RunAsync(string[] launchArgs)
             return await RunSilentCliModeAsync(launchArgs);
         }
 
+        if (File.Exists(configPath))
+        {
+            await RunServiceModeAsync();
+            return 0;
+        }
+
         if (Environment.UserInteractive)
         {
-            return await RunInteractiveModeAsync();
+            return await RunFirstRunSetupWizardAsync();
         }
 
         await RunServiceModeAsync();
@@ -79,44 +85,22 @@ async Task<int> RunSilentCliModeAsync(string[] launchArgs)
         return 1;
     }
 
-    SaveConfiguration(new AppConfiguration(options.BotToken, options.AdminChatId.Value));
+    SaveConfiguration(new AppConfiguration
+    {
+        BotToken = options.BotToken.Trim(),
+        AdminChatIds = [options.AdminChatId.Value]
+    });
     await InstallServiceAsync(writeOutput: false);
 
     return 0;
 }
 
-async Task<int> RunInteractiveModeAsync()
+async Task<int> RunFirstRunSetupWizardAsync()
 {
     Console.Title = ServiceName;
-    Console.WriteLine($"{ServiceName} setup");
+    Console.WriteLine("Welcome to WinSystemHelper Setup");
     Console.WriteLine($"Configuration path: {configPath}");
     Console.WriteLine();
-
-    if (await IsServiceInstalledAsync())
-    {
-        Console.WriteLine("Service is installed. Press 'U' to uninstall or 'Esc' to exit.");
-
-        while (true)
-        {
-            ConsoleKeyInfo key = Console.ReadKey(intercept: true);
-
-            if (key.Key == ConsoleKey.U)
-            {
-                if (!EnsureAdministrator())
-                {
-                    return 1;
-                }
-
-                await UninstallServiceAsync(writeOutput: true);
-                return 0;
-            }
-
-            if (key.Key == ConsoleKey.Escape)
-            {
-                return 0;
-            }
-        }
-    }
 
     if (!EnsureAdministrator())
     {
@@ -126,7 +110,7 @@ async Task<int> RunInteractiveModeAsync()
     Console.Write("Telegram Bot Token: ");
     string? botToken = Console.ReadLine();
 
-    Console.Write("Admin Chat ID: ");
+    Console.Write("Primary Admin Chat ID: ");
     string? chatIdText = Console.ReadLine();
 
     if (string.IsNullOrWhiteSpace(botToken) || !long.TryParse(chatIdText, out long adminChatId))
@@ -135,7 +119,47 @@ async Task<int> RunInteractiveModeAsync()
         return 1;
     }
 
-    SaveConfiguration(new AppConfiguration(botToken.Trim(), adminChatId));
+    List<long> adminChatIds = [adminChatId];
+
+    while (true)
+    {
+        Console.Write("Do you want to add another Admin Chat ID? (y/n): ");
+        string? answer = Console.ReadLine()?.Trim();
+
+        if (answer?.Equals("n", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            break;
+        }
+
+        if (answer?.Equals("y", StringComparison.OrdinalIgnoreCase) != true)
+        {
+            Console.WriteLine("Please enter 'y' or 'n'.");
+            continue;
+        }
+
+        Console.Write("Additional Admin Chat ID: ");
+        string? additionalChatIdText = Console.ReadLine();
+
+        if (!long.TryParse(additionalChatIdText, out long additionalChatId) || additionalChatId == 0)
+        {
+            Console.WriteLine("Invalid chat ID. Try again.");
+            continue;
+        }
+
+        if (adminChatIds.Contains(additionalChatId))
+        {
+            Console.WriteLine("That admin chat ID is already configured.");
+            continue;
+        }
+
+        adminChatIds.Add(additionalChatId);
+    }
+
+    SaveConfiguration(new AppConfiguration
+    {
+        BotToken = botToken.Trim(),
+        AdminChatIds = adminChatIds.ToArray()
+    });
     await InstallServiceAsync(writeOutput: true);
 
     return 0;
@@ -248,9 +272,9 @@ AppConfiguration LoadConfiguration()
 
     if (configuration is null ||
         string.IsNullOrWhiteSpace(configuration.BotToken) ||
-        configuration.AdminChatId == 0)
+        configuration.GetEffectiveAdminChatIds().Count == 0)
     {
-        throw new InvalidOperationException($"{configPath} is missing BotToken or AdminChatId.");
+        throw new InvalidOperationException($"{configPath} is missing BotToken or AdminChatIds.");
     }
 
     return configuration;
