@@ -8,8 +8,12 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 - Telegram Bot integration for authenticated remote administration.
 - Admin-only command handling using the configured Telegram chat ID.
 - Startup and wake-from-sleep alerts.
+- Modern Standby-compatible wake detection through the Windows System event log.
+- Fail-fast Telegram configuration validation to avoid endless retries on invalid credentials.
 - Resilient Telegram polling with exponential backoff and strict network timeouts.
 - Session 0-aware command execution for workstation lock and alert sound behavior using active-user-session process launching.
+- Interactive active-user prompts using Base64-encoded PowerShell UI scripts.
+- Overt active-alarm microphone recording with local visual/audio warnings.
 - Emoji-rich Telegram responses with a native Telegram command menu.
 - Local configuration through `config.json` stored beside the executable.
 
@@ -20,8 +24,16 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/status` | Shows machine, user, service uptime, network state, and timestamp. |
 | `/lock` | Locks the active Windows workstation. |
 | `/shutdown` | Initiates a graceful shutdown after 10 seconds. |
+| `/restart` | Initiates a system restart after 10 seconds. |
+| `/sleep` | Puts the workstation to sleep. |
 | `/ip` | Returns the current public IP address. |
 | `/alarm` | Plays a system alert sound through the active user session. |
+| `/mic [seconds]` | Triggers an overt active alarm and returns an audio recording. |
+| `/mic [seconds] loop` | Starts a persistent overt active alarm loop. |
+| `/mic stop` | Stops the persistent active alarm loop. |
+| `/msg [text]` | Shows a warning message on the active user's screen. |
+| `/ask [text]` | Shows a Yes/No question and returns the user's answer. |
+| `/prompt [text]` | Forces a text response from the active user and returns it to Telegram. |
 | `/help` | Shows the available remote commands. |
 | `/stop` | Stops the WinSystemHelper service. |
 | `/uninstall` | Stops and deletes the WinSystemHelper service. |

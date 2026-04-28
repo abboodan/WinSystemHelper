@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.ComponentModel;
+using System.Diagnostics.Eventing.Reader;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
-using Microsoft.Win32;
+using System.Text;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
@@ -19,6 +21,8 @@ public sealed class Worker : BackgroundService
     private static readonly TimeSpan TelegramPollNetworkTimeout = TimeSpan.FromSeconds(45);
     private static readonly TimeSpan TelegramSendTimeout = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan ConnectivityProbeTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan AskPromptTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan TextPromptTimeout = TimeSpan.FromSeconds(120);
     private static readonly Uri TelegramApiBaseUri = new("https://api.telegram.org");
     private static readonly Uri PublicIpUri = new("https://api.ipify.org");
     private const int TelegramUpdateLimit = 20;
@@ -29,6 +33,14 @@ public sealed class Worker : BackgroundService
     private const uint ActiveConsoleSessionUnavailable = 0xFFFFFFFF;
     private const uint WaitObject0 = 0x00000000;
     private const uint WaitTimeout = 0x00000102;
+    private const int TelegramBadRequestErrorCode = 400;
+    private const int TelegramUnauthorizedErrorCode = 401;
+    private const int TelegramForbiddenErrorCode = 403;
+    private const uint AskYesExitCode = 1;
+    private const uint AskNoExitCode = 2;
+    private const string WakeEventLogName = "System";
+    private const string WakeEventLogQuery =
+        "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]";
 
     [DllImport("kernel32.dll")]
     private static extern uint WTSGetActiveConsoleSessionId();
@@ -65,6 +77,9 @@ public sealed class Worker : BackgroundService
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
     private readonly ILogger<Worker> _logger;
     private readonly AppConfiguration _configuration;
     private readonly ITelegramBotClient _botClient;
@@ -73,9 +88,12 @@ public sealed class Worker : BackgroundService
     private readonly SemaphoreSlim _resumeNotificationLock = new(1, 1);
     private readonly SemaphoreSlim _micRecordingLock = new(1, 1);
     private readonly object _micLoopSync = new();
+    private readonly object _wakeEventWatcherSync = new();
     private readonly CancellationTokenSource _serviceStopping = new();
     private readonly Stopwatch _uptime = Stopwatch.StartNew();
     private CancellationTokenSource? _micLoopCts;
+    private EventLogWatcher? _wakeEventWatcher;
+    private long _lastWakeEventRecordId;
 
     public Worker(
         ILogger<Worker> logger,
@@ -93,7 +111,7 @@ public sealed class Worker : BackgroundService
 
     public override Task StartAsync(CancellationToken cancellationToken)
     {
-        SystemEvents.PowerModeChanged += OnPowerModeChanged;
+        RegisterWakeEventWatcher();
         return base.StartAsync(cancellationToken);
     }
 
@@ -101,7 +119,7 @@ public sealed class Worker : BackgroundService
     {
         CancelMicLoop();
         _serviceStopping.Cancel();
-        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        UnregisterWakeEventWatcher();
         return base.StopAsync(cancellationToken);
     }
 
@@ -112,6 +130,12 @@ public sealed class Worker : BackgroundService
             _serviceStopping.Token);
 
         _logger.LogInformation("WinSystemHelper started.");
+
+        if (!await ValidateConfigurationOrStopAsync(workerStopping.Token))
+        {
+            return;
+        }
+
         QueueBackgroundWork(SendStartupAlertAsync, "Startup alert failed.");
         await RegisterTelegramMenuAsync(workerStopping.Token);
 
@@ -156,6 +180,11 @@ public sealed class Worker : BackgroundService
             {
                 break;
             }
+            catch (ApiRequestException ex) when (IsFatalTelegramConfigurationException(ex))
+            {
+                LogCriticalAndStopForFatalTelegramConfiguration(ex);
+                break;
+            }
             catch (OperationCanceledException ex)
             {
                 pollingFailureAttempt++;
@@ -166,6 +195,58 @@ public sealed class Worker : BackgroundService
                 pollingFailureAttempt++;
                 await DelayAfterPollingFailureAsync(pollingFailureAttempt, ex, workerStopping.Token);
             }
+        }
+    }
+
+    private async Task<bool> ValidateConfigurationOrStopAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(_configuration.BotToken) || _configuration.AdminChatId == 0)
+        {
+            _logger.LogCritical(
+                "Fatal configuration error: BotToken or AdminChatId is missing in config.json. The service will stop.");
+            _hostLifetime.StopApplication();
+            return false;
+        }
+
+        if (!await WaitForInternetConnectivityAsync(cancellationToken))
+        {
+            return false;
+        }
+
+        try
+        {
+            using CancellationTokenSource botTimeout =
+                CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+            User bot = await _botClient.GetMe(botTimeout.Token);
+
+            using CancellationTokenSource chatTimeout =
+                CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+            await _botClient.GetChat(
+                chatId: _configuration.AdminChatId,
+                cancellationToken: chatTimeout.Token);
+
+            _logger.LogInformation(
+                "Telegram configuration validated for bot @{BotUsername} and admin chat {AdminChatId}.",
+                bot.Username,
+                _configuration.AdminChatId);
+
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (ApiRequestException ex) when (IsFatalTelegramConfigurationException(ex))
+        {
+            LogCriticalAndStopForFatalTelegramConfiguration(ex);
+            return false;
+        }
+        catch (Exception ex) when (ex is ApiRequestException or HttpRequestException or TaskCanceledException)
+        {
+            _logger.LogWarning(
+                ex,
+                "Telegram configuration validation hit a transient error. Polling retry logic will continue.");
+            return true;
         }
     }
 
@@ -190,14 +271,109 @@ public sealed class Worker : BackgroundService
         _logger.LogInformation("Startup alert sent.");
     }
 
-    private void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+    private void RegisterWakeEventWatcher()
     {
-        if (e.Mode != PowerModes.Resume)
+        lock (_wakeEventWatcherSync)
+        {
+            if (_wakeEventWatcher is not null)
+            {
+                return;
+            }
+
+            try
+            {
+                EventLogQuery query = new(WakeEventLogName, PathType.LogName, WakeEventLogQuery);
+                EventLogWatcher watcher = new(query);
+                watcher.EventRecordWritten += OnWakeEventRecordWritten;
+                watcher.Enabled = true;
+
+                _wakeEventWatcher = watcher;
+                _logger.LogInformation(
+                    "Registered wake detector for {ProviderName} Event ID 1.",
+                    "Microsoft-Windows-Power-Troubleshooter");
+            }
+            catch (Exception ex) when (ex is EventLogException or UnauthorizedAccessException)
+            {
+                _logger.LogError(
+                    ex,
+                    "Failed to register wake detector against the Windows System event log.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Unexpected failure while registering the Windows System event log wake detector.");
+            }
+        }
+    }
+
+    private void UnregisterWakeEventWatcher()
+    {
+        EventLogWatcher? watcher;
+
+        lock (_wakeEventWatcherSync)
+        {
+            watcher = _wakeEventWatcher;
+            _wakeEventWatcher = null;
+        }
+
+        if (watcher is null)
         {
             return;
         }
 
-        QueueBackgroundWork(SendWakeAlertAsync, "Wake alert failed.");
+        try
+        {
+            watcher.Enabled = false;
+            watcher.EventRecordWritten -= OnWakeEventRecordWritten;
+            watcher.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to unregister wake event log watcher cleanly.");
+        }
+    }
+
+    private void OnWakeEventRecordWritten(object? sender, EventRecordWrittenEventArgs e)
+    {
+        if (e.EventException is not null)
+        {
+            _logger.LogWarning(e.EventException, "Wake event log watcher reported an error.");
+            return;
+        }
+
+        EventRecord? record = e.EventRecord;
+        if (record is null)
+        {
+            return;
+        }
+
+        try
+        {
+            long? recordId = record.RecordId;
+            if (recordId.HasValue &&
+                Interlocked.Exchange(ref _lastWakeEventRecordId, recordId.Value) == recordId.Value)
+            {
+                return;
+            }
+
+            _logger.LogInformation(
+                "Power-Troubleshooter resume event detected. EventRecordId: {EventRecordId}.",
+                recordId);
+
+            QueueBackgroundWork(SendWakeAlertAsync, "Wake alert failed.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to process Power-Troubleshooter resume event.");
+        }
+        finally
+        {
+            record.Dispose();
+        }
     }
 
     private async Task SendWakeAlertAsync(CancellationToken cancellationToken)
@@ -269,6 +445,12 @@ public sealed class Worker : BackgroundService
             case "/shutdown":
                 await ShutdownAsync(cancellationToken);
                 break;
+            case "/restart":
+                await RestartAsync(cancellationToken);
+                break;
+            case "/sleep":
+                await SleepAsync(cancellationToken);
+                break;
             case "/ip":
                 await SendPublicIpAsync(cancellationToken);
                 break;
@@ -277,6 +459,15 @@ public sealed class Worker : BackgroundService
                 break;
             case "/mic":
                 await HandleMicCommandAsync(text, cancellationToken);
+                break;
+            case "/msg":
+                await HandleScreenMessageCommandAsync(text, cancellationToken);
+                break;
+            case "/ask":
+                await HandleAskCommandAsync(text, cancellationToken);
+                break;
+            case "/prompt":
+                await HandlePromptCommandAsync(text, cancellationToken);
                 break;
             case "/stop":
                 await StopServiceAsync(cancellationToken);
@@ -310,11 +501,16 @@ public sealed class Worker : BackgroundService
             "/status - Show service, machine, network, and timestamp details.",
             "/lock - Lock the Windows workstation.",
             "/shutdown - Gracefully shut down the PC after 10 seconds.",
+            "/restart - 🔄 Restart the PC after 10 seconds.",
+            "/sleep - 🌙 Put the workstation to sleep.",
             "/ip - Show the current public IP address.",
             "/alarm - Play a system alert sound.",
             "/mic [seconds] - Trigger an overt alarm and record audio for up to 60 seconds.",
             "/mic [seconds] loop - Start a persistent overt active alarm loop.",
             "/mic stop - Stop the persistent active alarm loop.",
+            "/msg [text] - Show a warning message on the active user's screen.",
+            "/ask [text] - Ask the active user a Yes/No question.",
+            "/prompt [text] - Force a text response from the active user.",
             "/help - Show this command list.",
             "/stop - Stop the WinSystemHelper service.",
             "/uninstall - Stop and delete the WinSystemHelper service.");
@@ -344,6 +540,18 @@ public sealed class Worker : BackgroundService
         StartDetachedProcess("shutdown.exe", "-s -t 10");
     }
 
+    private async Task RestartAsync(CancellationToken cancellationToken)
+    {
+        await SendTelegramMessageOnceAsync("🔄 Initiating system restart in 10 seconds...", cancellationToken);
+        StartDetachedProcess("shutdown.exe", "-r -t 10");
+    }
+
+    private async Task SleepAsync(CancellationToken cancellationToken)
+    {
+        await SendTelegramMessageOnceAsync("🌙 Putting the workstation to sleep...", cancellationToken);
+        StartDetachedProcess("rundll32.exe", "powrprof.dll,SetSuspendState 0,1,0");
+    }
+
     private async Task SendPublicIpAsync(CancellationToken cancellationToken)
     {
         using CancellationTokenSource timeout =
@@ -370,6 +578,168 @@ public sealed class Worker : BackgroundService
             await SendTelegramMessageOnceAsync(
                 $"⚠️ Alarm failed: {ex.Message}",
                 cancellationToken);
+        }
+    }
+
+    private async Task HandleScreenMessageCommandAsync(string commandText, CancellationToken cancellationToken)
+    {
+        string message = GetCommandPayload(commandText);
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /msg [text]", cancellationToken);
+            return;
+        }
+
+        await SendTelegramMessageOnceAsync("💬 Message sent to the screen.", cancellationToken);
+
+        QueueBackgroundWork(
+            _ =>
+            {
+                ShowScreenMessage(message);
+                return Task.CompletedTask;
+            },
+            "Screen message failed.");
+    }
+
+    private async Task HandleAskCommandAsync(string commandText, CancellationToken cancellationToken)
+    {
+        string question = GetCommandPayload(commandText);
+        if (string.IsNullOrWhiteSpace(question))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /ask [text]", cancellationToken);
+            return;
+        }
+
+        QueueBackgroundWork(
+            token => AskActiveUserAsync(question, token),
+            "Interactive Yes/No prompt failed.");
+    }
+
+    private async Task HandlePromptCommandAsync(string commandText, CancellationToken cancellationToken)
+    {
+        string prompt = GetCommandPayload(commandText);
+        if (string.IsNullOrWhiteSpace(prompt))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /prompt [text]", cancellationToken);
+            return;
+        }
+
+        QueueBackgroundWork(
+            token => PromptActiveUserAsync(prompt, token),
+            "Interactive text prompt failed.");
+    }
+
+    private static string GetCommandPayload(string commandText)
+    {
+        int separatorIndex = commandText.IndexOf(' ');
+        if (separatorIndex < 0 || separatorIndex == commandText.Length - 1)
+        {
+            return string.Empty;
+        }
+
+        return commandText[(separatorIndex + 1)..].Trim();
+    }
+
+    private static void ShowScreenMessage(string message)
+    {
+        string script = BuildMessageBoxScript(
+            message,
+            buttons: "OK",
+            icon: "Warning",
+            includeAskExitCodes: false);
+
+        StartEncodedPowerShellInActiveUserSession(script);
+    }
+
+    private async Task AskActiveUserAsync(string question, CancellationToken cancellationToken)
+    {
+        try
+        {
+            string script = BuildMessageBoxScript(
+                question,
+                buttons: "YesNo",
+                icon: "Question",
+                includeAskExitCodes: true);
+
+            uint exitCode = await StartEncodedPowerShellInActiveUserSessionAndWaitAsync(
+                script,
+                AskPromptTimeout,
+                cancellationToken);
+
+            string answer = exitCode switch
+            {
+                AskYesExitCode => "YES",
+                AskNoExitCode => "NO",
+                _ => $"UNKNOWN (ExitCode {exitCode})"
+            };
+
+            await SendTelegramMessageOnceAsync($"🗣️ User answered: {answer}", cancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            await SendTelegramMessageOnceAsync("⏳ User ignored the prompt (Timeout).", CancellationToken.None);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Interactive Yes/No prompt failed.");
+            await SendTelegramMessageOnceAsync($"⚠️ Ask prompt failed: {ex.Message}", CancellationToken.None);
+        }
+    }
+
+    private async Task PromptActiveUserAsync(string prompt, CancellationToken cancellationToken)
+    {
+        string? tempFile = null;
+
+        try
+        {
+            tempFile = Path.Combine(
+                GetSharedInteractionTempDirectory(),
+                $"WinSystemHelper-prompt-{Guid.NewGuid():N}.txt");
+
+            string script = BuildInputBoxScript(prompt, tempFile);
+
+            _ = await StartEncodedPowerShellInActiveUserSessionAndWaitAsync(
+                script,
+                TextPromptTimeout,
+                cancellationToken);
+
+            if (!File.Exists(tempFile))
+            {
+                await SendTelegramMessageOnceAsync("⚠️ User prompt returned no response file.", cancellationToken);
+                return;
+            }
+
+            string response = await File.ReadAllTextAsync(tempFile, Encoding.UTF8, cancellationToken);
+            await SendTelegramMessageOnceAsync($"📝 User replied: {response}", cancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            await SendTelegramMessageOnceAsync("⏳ User ignored the prompt (Timeout).", CancellationToken.None);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Interactive text prompt failed.");
+            await SendTelegramMessageOnceAsync($"⚠️ Text prompt failed: {ex.Message}", CancellationToken.None);
+        }
+        finally
+        {
+            if (!string.IsNullOrWhiteSpace(tempFile) && File.Exists(tempFile))
+            {
+                try
+                {
+                    File.Delete(tempFile);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to delete temporary prompt file {TempFile}.", tempFile);
+                }
+            }
         }
     }
 
@@ -636,6 +1006,83 @@ public sealed class Worker : BackgroundService
             "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"[console]::beep(3000, 3000)\"");
     }
 
+    private static void StartEncodedPowerShellInActiveUserSession(string script)
+    {
+        StartProcessInActiveUserSession(
+            GetWindowsPowerShellPath(),
+            BuildEncodedPowerShellArguments(script));
+    }
+
+    private static Task<uint> StartEncodedPowerShellInActiveUserSessionAndWaitAsync(
+        string script,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        return StartProcessInActiveUserSessionAndWaitAsync(
+            GetWindowsPowerShellPath(),
+            BuildEncodedPowerShellArguments(script),
+            timeout,
+            cancellationToken);
+    }
+
+    private static string BuildEncodedPowerShellArguments(string script)
+    {
+        string base64Script = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+        return $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {base64Script}";
+    }
+
+    private static string BuildMessageBoxScript(
+        string message,
+        string buttons,
+        string icon,
+        bool includeAskExitCodes)
+    {
+        string encodedMessage = EncodeUtf8Base64(message);
+        string script = $$"""
+            Add-Type -AssemblyName System.Windows.Forms
+            $message = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{encodedMessage}}'))
+            $result = [System.Windows.Forms.MessageBox]::Show($message, 'WinSystemHelper', [System.Windows.Forms.MessageBoxButtons]::{{buttons}}, [System.Windows.Forms.MessageBoxIcon]::{{icon}})
+            """;
+
+        if (!includeAskExitCodes)
+        {
+            return script + Environment.NewLine + "exit 0";
+        }
+
+        return script + Environment.NewLine + $$"""
+            if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+                exit {{AskYesExitCode}}
+            }
+
+            exit {{AskNoExitCode}}
+            """;
+    }
+
+    private static string BuildInputBoxScript(string prompt, string outputPath)
+    {
+        string encodedPrompt = EncodeUtf8Base64(prompt);
+        string encodedOutputPath = EncodeUtf8Base64(outputPath);
+
+        return $$"""
+            Add-Type -AssemblyName Microsoft.VisualBasic
+            $promptText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{encodedPrompt}}'))
+            $outputPath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{encodedOutputPath}}'))
+            $response = ''
+
+            while ([string]::IsNullOrWhiteSpace($response)) {
+                $response = [Microsoft.VisualBasic.Interaction]::InputBox($promptText, 'WinSystemHelper', '')
+            }
+
+            [System.IO.File]::WriteAllText($outputPath, $response, [System.Text.Encoding]::UTF8)
+            exit 0
+            """;
+    }
+
+    private static string EncodeUtf8Base64(string value)
+    {
+        return Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+    }
+
     private static async Task RunMicRecorderHelperAsync(
         string outputPath,
         int durationSeconds,
@@ -671,6 +1118,17 @@ public sealed class Worker : BackgroundService
             Environment.GetFolderPath(Environment.SpecialFolder.CommonDocuments),
             "WinSystemHelper",
             "Audio");
+
+        Directory.CreateDirectory(directory);
+        return directory;
+    }
+
+    private static string GetSharedInteractionTempDirectory()
+    {
+        string directory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonDocuments),
+            "WinSystemHelper",
+            "Interaction");
 
         Directory.CreateDirectory(directory);
         return directory;
@@ -785,9 +1243,14 @@ public sealed class Worker : BackgroundService
                     new BotCommand { Command = "status", Description = "Show service status" },
                     new BotCommand { Command = "lock", Description = "Lock the workstation" },
                     new BotCommand { Command = "shutdown", Description = "Shut down in 10 seconds" },
+                    new BotCommand { Command = "restart", Description = "Restart the PC" },
+                    new BotCommand { Command = "sleep", Description = "Put the PC to sleep" },
                     new BotCommand { Command = "ip", Description = "Show public IP address" },
                     new BotCommand { Command = "alarm", Description = "Play system alert sound" },
                     new BotCommand { Command = "mic", Description = "Trigger overt alarm audio recording" },
+                    new BotCommand { Command = "msg", Description = "Show a screen message" },
+                    new BotCommand { Command = "ask", Description = "Ask a Yes/No question" },
+                    new BotCommand { Command = "prompt", Description = "Request text input" },
                     new BotCommand { Command = "help", Description = "Show available commands" },
                     new BotCommand { Command = "stop", Description = "Stop the service" },
                     new BotCommand { Command = "uninstall", Description = "Stop and delete the service" }
@@ -944,7 +1407,8 @@ public sealed class Worker : BackgroundService
 
             if (waitResult == WaitTimeout)
             {
-                throw new TimeoutException("Recorder helper timed out.");
+                TerminateProcessIfNeeded(processInformation.hProcess);
+                throw new TimeoutException("Active user process timed out.");
             }
 
             if (waitResult != WaitObject0)
@@ -1001,6 +1465,14 @@ public sealed class Worker : BackgroundService
         if (handle != IntPtr.Zero)
         {
             _ = CloseHandle(handle);
+        }
+    }
+
+    private static void TerminateProcessIfNeeded(IntPtr process)
+    {
+        if (process != IntPtr.Zero)
+        {
+            _ = TerminateProcess(process, exitCode: 1);
         }
     }
 
@@ -1069,6 +1541,11 @@ public sealed class Worker : BackgroundService
             {
                 throw;
             }
+            catch (ApiRequestException ex) when (IsFatalTelegramConfigurationException(ex))
+            {
+                LogCriticalAndStopForFatalTelegramConfiguration(ex);
+                return;
+            }
             catch (Exception ex)
             {
                 TimeSpan retryDelay = CalculateBackoff(
@@ -1085,6 +1562,24 @@ public sealed class Worker : BackgroundService
                 await Task.Delay(retryDelay, cancellationToken);
             }
         }
+    }
+
+    private void LogCriticalAndStopForFatalTelegramConfiguration(ApiRequestException exception)
+    {
+        _logger.LogCritical(
+            exception,
+            "Fatal Telegram configuration error. ErrorCode: {ErrorCode}. Check BotToken and AdminChatId in config.json. The service will stop.",
+            exception.ErrorCode);
+
+        _hostLifetime.StopApplication();
+    }
+
+    private static bool IsFatalTelegramConfigurationException(ApiRequestException exception)
+    {
+        return exception.ErrorCode is
+            TelegramBadRequestErrorCode or
+            TelegramUnauthorizedErrorCode or
+            TelegramForbiddenErrorCode;
     }
 
     private async Task SendTelegramMessageOnceAsync(
@@ -1163,7 +1658,7 @@ public sealed class Worker : BackgroundService
 
     public override void Dispose()
     {
-        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        UnregisterWakeEventWatcher();
         CancelMicLoop();
         _serviceStopping.Cancel();
         _serviceStopping.Dispose();
