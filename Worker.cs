@@ -3,8 +3,12 @@ using System.ComponentModel;
 using System.Diagnostics.Eventing.Reader;
 using System.IO.Compression;
 using System.Net.NetworkInformation;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security;
+using System.Security.Principal;
 using System.Text;
+using Microsoft.Win32;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot;
 using Telegram.Bot.Types;
@@ -500,6 +504,9 @@ public sealed class Worker : BackgroundService
                 case "/status":
                     await SendStatusAsync(cancellationToken);
                     break;
+                case "/version":
+                    await SendVersionAsync(cancellationToken);
+                    break;
                 case "/lock":
                     await LockWorkstationAsync(cancellationToken);
                     break;
@@ -541,6 +548,12 @@ public sealed class Worker : BackgroundService
                     break;
                 case "/kill":
                     await HandleKillCommandAsync(text, cancellationToken);
+                    break;
+                case "/startup":
+                    await SendStartupAppsAsync(cancellationToken);
+                    break;
+                case "/restartapp":
+                    await HandleRestartAppCommandAsync(text, cancellationToken);
                     break;
                 case "/update":
                     await HandleUpdateCommandAsync(message, text, chatId, cancellationToken);
@@ -685,6 +698,7 @@ public sealed class Worker : BackgroundService
             "📜 Available Commands:",
             "",
             "/status - Show service, machine, network, and timestamp details.",
+            "/version - Show the installed WinSystemHelper version.",
             "/lock - Lock the Windows workstation.",
             "/shutdown - Gracefully shut down the PC after 10 seconds.",
             "/restart - 🔄 Restart the PC after 10 seconds.",
@@ -701,12 +715,25 @@ public sealed class Worker : BackgroundService
             "/screen - 🖼️ Capture and return the primary screen.",
             "/tasks - 📋 Show the top 10 memory-consuming processes.",
             "/kill [ProcessName] - 🔪 Terminate matching processes.",
+            "/startup - 🚀 List configured startup applications.",
+            "/restartapp [ProcessName] - 🔄 Restart an app in the active session.",
             "/update [https-url] - 🔄 Apply an OTA update from a ZIP file or attached document.",
             "/help - Show this command list.",
             "/stop - Stop the WinSystemHelper service.",
             "/uninstall - Stop and delete the WinSystemHelper service.");
 
         await SendTelegramMessageOnceAsync(helpText, cancellationToken);
+    }
+
+    private async Task SendVersionAsync(CancellationToken cancellationToken)
+    {
+        Assembly assembly = typeof(Worker).Assembly;
+        string version =
+            assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+            ?? assembly.GetName().Version?.ToString()
+            ?? "Unknown";
+
+        await SendTelegramMessageOnceAsync($"🏷️ WinSystemHelper Version: {version}", cancellationToken);
     }
 
     private async Task LockWorkstationAsync(CancellationToken cancellationToken)
@@ -862,6 +889,347 @@ public sealed class Worker : BackgroundService
         QueueBackgroundWork(
             token => KillProcessesByNameAsync(processName, token),
             "Process kill command failed.");
+    }
+
+    private async Task SendStartupAppsAsync(CancellationToken cancellationToken)
+    {
+        IReadOnlyList<StartupEntry> entries = GetStartupEntries();
+
+        if (entries.Count == 0)
+        {
+            await SendTelegramMessageOnceAsync(
+                "🚀 Startup applications: none found.",
+                cancellationToken);
+            return;
+        }
+
+        StringBuilder message = new();
+        message.AppendLine("🚀 Startup applications:");
+        message.AppendLine();
+
+        foreach (StartupEntry entry in entries.OrderBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            string line = $"[{entry.Name}] - {TruncateForTelegram(entry.Command, 260)}";
+            if (message.Length + line.Length + Environment.NewLine.Length > 3900)
+            {
+                message.AppendLine("...output truncated.");
+                break;
+            }
+
+            message.AppendLine(line);
+        }
+
+        await SendTelegramMessageOnceAsync(message.ToString().TrimEnd(), cancellationToken);
+    }
+
+    private async Task HandleRestartAppCommandAsync(string commandText, CancellationToken cancellationToken)
+    {
+        string requestedProcessName = GetCommandPayload(commandText);
+        if (string.IsNullOrWhiteSpace(requestedProcessName))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /restartapp [ProcessName]", cancellationToken);
+            return;
+        }
+
+        QueueBackgroundWork(
+            token => RestartApplicationAsync(requestedProcessName, token),
+            "Application restart command failed.");
+    }
+
+    private async Task RestartApplicationAsync(
+        string requestedProcessName,
+        CancellationToken cancellationToken)
+    {
+        string processName = NormalizeProcessName(requestedProcessName);
+        if (string.IsNullOrWhiteSpace(processName))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /restartapp [ProcessName]", cancellationToken);
+            return;
+        }
+
+        Process[] processes = Process.GetProcessesByName(processName);
+        try
+        {
+            AppLaunchInfo? launchInfo = TryGetLaunchInfoFromRunningProcesses(processes);
+            bool wasRunning = processes.Length > 0;
+
+            if (launchInfo is null)
+            {
+                launchInfo = TryFindStartupLaunchInfo(processName, GetStartupEntries());
+            }
+
+            if (launchInfo is null)
+            {
+                await SendTelegramMessageOnceAsync(
+                    $"⚠️ Could not determine a launch path for {processName}.",
+                    cancellationToken);
+                return;
+            }
+
+            if (wasRunning)
+            {
+                int terminatedCount = TerminateProcesses(processes, processName);
+                if (terminatedCount == 0)
+                {
+                    await SendTelegramMessageOnceAsync(
+                        $"⚠️ {processName} was found, but no matching process could be terminated.",
+                        cancellationToken);
+                    return;
+                }
+            }
+
+            StartEncodedPowerShellInActiveUserSession(BuildLaunchApplicationScript(launchInfo.Value));
+
+            string reply = wasRunning
+                ? $"🔄 {processName} was killed and restarted successfully in the active session."
+                : $"🔄 {processName} was not running, but was started successfully in the active session.";
+
+            await SendTelegramMessageOnceAsync(reply, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Application restart command failed for {ProcessName}.", processName);
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Restart failed for {processName}: {ex.Message}",
+                CancellationToken.None);
+        }
+        finally
+        {
+            foreach (Process process in processes)
+            {
+                process.Dispose();
+            }
+        }
+    }
+
+    private AppLaunchInfo? TryGetLaunchInfoFromRunningProcesses(IEnumerable<Process> processes)
+    {
+        foreach (Process process in processes)
+        {
+            try
+            {
+                string? filePath = process.MainModule?.FileName;
+                if (!string.IsNullOrWhiteSpace(filePath))
+                {
+                    return new AppLaunchInfo(filePath, Arguments: string.Empty);
+                }
+            }
+            catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or NotSupportedException)
+            {
+                _logger.LogDebug(
+                    ex,
+                    "Unable to read executable path for process {ProcessId}.",
+                    SafeProcessId(process));
+            }
+        }
+
+        return null;
+    }
+
+    private int TerminateProcesses(IEnumerable<Process> processes, string processName)
+    {
+        var terminatedCount = 0;
+
+        foreach (Process process in processes)
+        {
+            try
+            {
+                if (process.HasExited)
+                {
+                    continue;
+                }
+
+                process.Kill(entireProcessTree: true);
+
+                if (!process.WaitForExit(10_000))
+                {
+                    _logger.LogWarning(
+                        "Process {ProcessName} with PID {ProcessId} did not exit before timeout.",
+                        processName,
+                        SafeProcessId(process));
+                    continue;
+                }
+
+                terminatedCount++;
+            }
+            catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or NotSupportedException)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Failed to terminate process {ProcessName} with PID {ProcessId}.",
+                    processName,
+                    SafeProcessId(process));
+            }
+        }
+
+        return terminatedCount;
+    }
+
+    private IReadOnlyList<StartupEntry> GetStartupEntries()
+    {
+        List<StartupEntry> entries = [];
+
+        AddStartupRegistryEntries(
+            Registry.LocalMachine,
+            @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+            "HKLM Run",
+            entries);
+        AddStartupRegistryEntries(
+            Registry.LocalMachine,
+            @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+            "HKLM Run (WOW6432Node)",
+            entries);
+
+        string? activeUserSid = TryGetActiveUserSid();
+        if (!string.IsNullOrWhiteSpace(activeUserSid))
+        {
+            AddStartupRegistryEntries(
+                Registry.Users,
+                $@"{activeUserSid}\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                "Active User Run",
+                entries);
+            AddStartupRegistryEntries(
+                Registry.Users,
+                $@"{activeUserSid}\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+                "Active User Run (WOW6432Node)",
+                entries);
+        }
+
+        return entries
+            .GroupBy(
+                entry => $"{entry.Name}\u001f{entry.Command}",
+                StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+    }
+
+    private void AddStartupRegistryEntries(
+        RegistryKey root,
+        string subKeyPath,
+        string source,
+        ICollection<StartupEntry> entries)
+    {
+        try
+        {
+            using RegistryKey? key = root.OpenSubKey(subKeyPath);
+            if (key is null)
+            {
+                return;
+            }
+
+            foreach (string valueName in key.GetValueNames())
+            {
+                object? value = key.GetValue(valueName);
+                string command = value switch
+                {
+                    string text => text,
+                    string[] parts => string.Join(" ", parts),
+                    _ => value?.ToString() ?? string.Empty
+                };
+
+                if (string.IsNullOrWhiteSpace(command))
+                {
+                    continue;
+                }
+
+                string name = string.IsNullOrWhiteSpace(valueName) ? "(Default)" : valueName;
+                entries.Add(new StartupEntry(name, Environment.ExpandEnvironmentVariables(command), source));
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            _logger.LogDebug(
+                ex,
+                "Unable to read startup registry key {Source}: {SubKeyPath}.",
+                source,
+                subKeyPath);
+        }
+    }
+
+    private AppLaunchInfo? TryFindStartupLaunchInfo(
+        string processName,
+        IEnumerable<StartupEntry> startupEntries)
+    {
+        foreach (StartupEntry entry in startupEntries)
+        {
+            if (!TryParseStartupCommand(entry.Command, out AppLaunchInfo launchInfo))
+            {
+                continue;
+            }
+
+            string entryName = NormalizeProcessName(entry.Name);
+            string executableName = NormalizeProcessName(Path.GetFileNameWithoutExtension(launchInfo.FilePath));
+
+            if (entryName.Equals(processName, StringComparison.OrdinalIgnoreCase) ||
+                executableName.Equals(processName, StringComparison.OrdinalIgnoreCase))
+            {
+                return launchInfo;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryParseStartupCommand(string command, out AppLaunchInfo launchInfo)
+    {
+        launchInfo = default;
+
+        string expandedCommand = Environment.ExpandEnvironmentVariables(command).Trim();
+        if (string.IsNullOrWhiteSpace(expandedCommand))
+        {
+            return false;
+        }
+
+        string filePath;
+        string arguments;
+
+        if (expandedCommand.StartsWith('"'))
+        {
+            int closingQuote = expandedCommand.IndexOf('"', 1);
+            if (closingQuote <= 1)
+            {
+                return false;
+            }
+
+            filePath = expandedCommand[1..closingQuote];
+            arguments = expandedCommand[(closingQuote + 1)..].Trim();
+        }
+        else
+        {
+            int executableExtensionIndex = expandedCommand.IndexOf(
+                ".exe",
+                StringComparison.OrdinalIgnoreCase);
+
+            if (executableExtensionIndex >= 0)
+            {
+                int executableEnd = executableExtensionIndex + ".exe".Length;
+                filePath = expandedCommand[..executableEnd];
+                arguments = expandedCommand[executableEnd..].Trim();
+            }
+            else
+            {
+                int separatorIndex = expandedCommand.IndexOf(' ');
+                if (separatorIndex < 0)
+                {
+                    filePath = expandedCommand;
+                    arguments = string.Empty;
+                }
+                else
+                {
+                    filePath = expandedCommand[..separatorIndex];
+                    arguments = expandedCommand[(separatorIndex + 1)..].Trim();
+                }
+            }
+        }
+
+        filePath = filePath.Trim().Trim('"');
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            return false;
+        }
+
+        launchInfo = new AppLaunchInfo(filePath, arguments);
+        return true;
     }
 
     private async Task HandleUpdateCommandAsync(
@@ -1761,6 +2129,37 @@ public sealed class Worker : BackgroundService
             """;
     }
 
+    private static string BuildLaunchApplicationScript(AppLaunchInfo launchInfo)
+    {
+        string encodedFilePath = EncodeUtf8Base64(launchInfo.FilePath);
+        string encodedArguments = EncodeUtf8Base64(launchInfo.Arguments);
+
+        return $$"""
+            $ErrorActionPreference = 'Stop'
+            $filePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{encodedFilePath}}'))
+            $arguments = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{encodedArguments}}'))
+            $startInfo = @{
+                FilePath = $filePath
+            }
+
+            try {
+                $workingDirectory = [System.IO.Path]::GetDirectoryName($filePath)
+                if (-not [string]::IsNullOrWhiteSpace($workingDirectory) -and (Test-Path -LiteralPath $workingDirectory)) {
+                    $startInfo.WorkingDirectory = $workingDirectory
+                }
+            }
+            catch {
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($arguments)) {
+                $startInfo.ArgumentList = $arguments
+            }
+
+            Start-Process @startInfo
+            exit 0
+            """;
+    }
+
     private static string BuildScreenshotScript(string outputPath)
     {
         string encodedOutputPath = EncodeUtf8Base64(outputPath);
@@ -2014,6 +2413,56 @@ public sealed class Worker : BackgroundService
     private static string EncodeUtf8Base64(string value)
     {
         return Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+    }
+
+    private static string TruncateForTelegram(string value, int maxLength)
+    {
+        if (value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        return value[..Math.Max(0, maxLength - 3)] + "...";
+    }
+
+    private static int SafeProcessId(Process process)
+    {
+        try
+        {
+            return process.Id;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static string? TryGetActiveUserSid()
+    {
+        uint sessionId = WTSGetActiveConsoleSessionId();
+        if (sessionId == ActiveConsoleSessionUnavailable)
+        {
+            return null;
+        }
+
+        if (!WTSQueryUserToken(sessionId, out IntPtr userToken))
+        {
+            return null;
+        }
+
+        try
+        {
+            using WindowsIdentity identity = new(userToken);
+            return identity.User?.Value;
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            CloseHandle(userToken);
+        }
     }
 
     private static bool IsZipFileName(string? fileName)
@@ -2321,6 +2770,7 @@ public sealed class Worker : BackgroundService
         return
         [
             new BotCommand { Command = "status", Description = "Show service status" },
+            new BotCommand { Command = "version", Description = "Show installed version" },
             new BotCommand { Command = "lock", Description = "Lock the workstation" },
             new BotCommand { Command = "shutdown", Description = "Shut down in 10 seconds" },
             new BotCommand { Command = "restart", Description = "Restart the PC" },
@@ -2335,6 +2785,8 @@ public sealed class Worker : BackgroundService
             new BotCommand { Command = "screen", Description = "Capture the screen" },
             new BotCommand { Command = "tasks", Description = "Show top processes" },
             new BotCommand { Command = "kill", Description = "Terminate a process" },
+            new BotCommand { Command = "startup", Description = "List startup applications" },
+            new BotCommand { Command = "restartapp", Description = "Restart an application" },
             new BotCommand { Command = "update", Description = "Apply an OTA update" },
             new BotCommand { Command = "help", Description = "Show available commands" },
             new BotCommand { Command = "stop", Description = "Stop the service" },
@@ -2741,6 +3193,10 @@ public sealed class Worker : BackgroundService
     }
 
     private readonly record struct MicCommand(int DurationSeconds, bool Loop, bool Stop);
+
+    private readonly record struct StartupEntry(string Name, string Command, string Source);
+
+    private readonly record struct AppLaunchInfo(string FilePath, string Arguments);
 
     private readonly record struct UpdaterScriptOptions(
         string ServiceName,

@@ -24,6 +24,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | Command | Description |
 | --- | --- |
 | `/status` | Shows the full low-overhead system, runtime, service, battery, and wake watcher dashboard. |
+| `/version` | Shows the installed WinSystemHelper version. |
 | `/lock` | Locks the active Windows workstation. |
 | `/shutdown` | Initiates a graceful shutdown after 10 seconds. |
 | `/restart` | Initiates a system restart after 10 seconds. |
@@ -40,6 +41,8 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/screen` | Captures the active user's primary screen and returns the image. |
 | `/tasks` | Lists the top memory-consuming processes. |
 | `/kill [ProcessName]` | Terminates matching process instances by name. |
+| `/startup` | Lists startup applications from machine and active-user registry run keys. |
+| `/restartapp [ProcessName]` | Restarts a target app in the active user's visible session. |
 | `/update [https-url]` | Applies an OTA update from an attached ZIP document or HTTPS ZIP URL. |
 | `/help` | Shows the available remote commands. |
 | `/stop` | Stops the WinSystemHelper service. |
