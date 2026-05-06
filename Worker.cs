@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.ComponentModel;
 using System.Diagnostics.Eventing.Reader;
+using System.IO.Compression;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -24,8 +25,10 @@ public sealed class Worker : BackgroundService
     private static readonly TimeSpan AskPromptTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan TextPromptTimeout = TimeSpan.FromSeconds(120);
     private static readonly TimeSpan ScreenshotTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan UpdateDownloadTimeout = TimeSpan.FromMinutes(5);
     private static readonly Uri TelegramApiBaseUri = new("https://api.telegram.org");
     private static readonly Uri PublicIpUri = new("https://api.ipify.org");
+    private const long MaxUpdatePackageBytes = 100L * 1024L * 1024L;
     private const int TelegramUpdateLimit = 20;
     private const int DefaultMicRecordingSeconds = 10;
     private const int MaxMicRecordingSeconds = 60;
@@ -41,6 +44,10 @@ public sealed class Worker : BackgroundService
     private const uint AskNoExitCode = 2;
     private const byte BatteryLifePercentUnknown = 255;
     private const byte BatteryFlagNoSystemBattery = 128;
+    private const string ServiceName = "WinSystemHelper";
+    private const string ConfigFileName = "config.json";
+    private const string ZipExtension = ".zip";
+    private const string UpdateStatusMarkerFileName = "WinSystemHelper-update-status.txt";
     private const string WakeEventLogName = "System";
     private const string WakeEventLogQuery =
         "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]";
@@ -95,6 +102,7 @@ public sealed class Worker : BackgroundService
     private readonly AsyncLocal<long?> _replyChatId = new();
     private readonly SemaphoreSlim _resumeNotificationLock = new(1, 1);
     private readonly SemaphoreSlim _micRecordingLock = new(1, 1);
+    private readonly SemaphoreSlim _updateLock = new(1, 1);
     private readonly object _micLoopSync = new();
     private readonly object _wakeEventWatcherSync = new();
     private readonly CancellationTokenSource _serviceStopping = new();
@@ -148,6 +156,7 @@ public sealed class Worker : BackgroundService
             return;
         }
 
+        QueueBackgroundWork(SendPendingUpdateStatusAsync, "Update status report failed.");
         QueueBackgroundWork(SendStartupAlertAsync, "Startup alert failed.");
         await RegisterTelegramMenuAsync(workerStopping.Token);
 
@@ -285,6 +294,36 @@ public sealed class Worker : BackgroundService
             cancellationToken);
 
         _logger.LogInformation("Startup alert sent.");
+    }
+
+    private async Task SendPendingUpdateStatusAsync(CancellationToken cancellationToken)
+    {
+        string statusMarkerPath = GetUpdateStatusMarkerPath();
+        if (!File.Exists(statusMarkerPath))
+        {
+            return;
+        }
+
+        try
+        {
+            string status = await File.ReadAllTextAsync(statusMarkerPath, Encoding.UTF8, cancellationToken);
+            if (!string.IsNullOrWhiteSpace(status))
+            {
+                await SendTelegramBroadcastOnceAsync(status.Trim(), cancellationToken);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to read or send pending OTA update status.");
+        }
+        finally
+        {
+            DeleteTempFile(statusMarkerPath);
+        }
     }
 
     private void RegisterWakeEventWatcher()
@@ -439,7 +478,7 @@ public sealed class Worker : BackgroundService
             return;
         }
 
-        string? text = message.Text?.Trim();
+        string? text = (message.Text ?? message.Caption)?.Trim();
         if (string.IsNullOrWhiteSpace(text))
         {
             return;
@@ -502,6 +541,9 @@ public sealed class Worker : BackgroundService
                     break;
                 case "/kill":
                     await HandleKillCommandAsync(text, cancellationToken);
+                    break;
+                case "/update":
+                    await HandleUpdateCommandAsync(message, text, chatId, cancellationToken);
                     break;
                 case "/stop":
                     await StopServiceAsync(cancellationToken);
@@ -659,6 +701,7 @@ public sealed class Worker : BackgroundService
             "/screen - 🖼️ Capture and return the primary screen.",
             "/tasks - 📋 Show the top 10 memory-consuming processes.",
             "/kill [ProcessName] - 🔪 Terminate matching processes.",
+            "/update [https-url] - 🔄 Apply an OTA update from a ZIP file or attached document.",
             "/help - Show this command list.",
             "/stop - Stop the WinSystemHelper service.",
             "/uninstall - Stop and delete the WinSystemHelper service.");
@@ -819,6 +862,289 @@ public sealed class Worker : BackgroundService
         QueueBackgroundWork(
             token => KillProcessesByNameAsync(processName, token),
             "Process kill command failed.");
+    }
+
+    private async Task HandleUpdateCommandAsync(
+        Message message,
+        string commandText,
+        long replyChatId,
+        CancellationToken cancellationToken)
+    {
+        if (!await _updateLock.WaitAsync(0, cancellationToken))
+        {
+            await SendTelegramMessageOnceAsync(
+                "⚠️ OTA update is already in progress.",
+                cancellationToken);
+            return;
+        }
+
+        string? updateRoot = null;
+        string? updaterScriptPath = null;
+        var updaterLaunched = false;
+
+        try
+        {
+            string updatesRoot = GetSharedTempDirectory("Updates");
+            string updateId = Guid.NewGuid().ToString("N");
+            updateRoot = Path.Combine(updatesRoot, updateId);
+            string extractRoot = Path.Combine(updateRoot, "Extracted");
+            string backupDirectory = Path.Combine(updateRoot, "Backup");
+            string zipPath = Path.Combine(updateRoot, "package.zip");
+            string logPath = Path.Combine(updateRoot, "update.log");
+            string statusMarkerPath = GetUpdateStatusMarkerPath();
+            updaterScriptPath = Path.Combine(updatesRoot, $"WinSystemHelper-update-{updateId}.ps1");
+
+            Directory.CreateDirectory(updateRoot);
+            Directory.CreateDirectory(extractRoot);
+
+            if (message.Document is { } document)
+            {
+                if (!IsZipFileName(document.FileName))
+                {
+                    await SendTelegramMessageOnceAsync(
+                        "⚠️ Update package rejected: attach a .zip file with caption /update.",
+                        cancellationToken);
+                    return;
+                }
+
+                await DownloadTelegramUpdatePackageAsync(document, zipPath, cancellationToken);
+            }
+            else
+            {
+                string urlText = GetCommandPayload(commandText);
+                if (string.IsNullOrWhiteSpace(urlText))
+                {
+                    await SendTelegramMessageOnceAsync(
+                        "⚠️ Usage: send /update https://example.com/update.zip or attach a .zip file with caption /update.",
+                        cancellationToken);
+                    return;
+                }
+
+                if (!TryParseUpdateUri(urlText, out Uri? updateUri, out string? uriError))
+                {
+                    await SendTelegramMessageOnceAsync($"⚠️ Update URL rejected: {uriError}", cancellationToken);
+                    return;
+                }
+
+                await DownloadUrlUpdatePackageAsync(updateUri!, zipPath, cancellationToken);
+            }
+
+            await ExtractUpdatePackageAsync(zipPath, extractRoot, cancellationToken);
+
+            string payloadRoot = ResolveUpdatePayloadRoot(extractRoot);
+            ValidateUpdatePayloadRoot(payloadRoot);
+
+            UpdaterScriptOptions scriptOptions = new(
+                ServiceName,
+                Environment.ProcessId,
+                payloadRoot,
+                AppContext.BaseDirectory,
+                backupDirectory,
+                updateRoot,
+                statusMarkerPath,
+                logPath);
+
+            await WriteUpdaterScriptAsync(updaterScriptPath, scriptOptions, cancellationToken);
+
+            await SendTelegramMessageOnceAsync(
+                "🔄 Update received. Service is restarting to apply updates...",
+                cancellationToken);
+
+            LaunchUpdaterScript(updaterScriptPath);
+            updaterLaunched = true;
+            _hostLifetime.StopApplication();
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "OTA update command failed.");
+            await SendTelegramMessageOnceAsync($"⚠️ OTA update failed: {ex.Message}", CancellationToken.None);
+        }
+        finally
+        {
+            if (!updaterLaunched)
+            {
+                DeleteTempFile(updaterScriptPath);
+                DeleteDirectorySafe(updateRoot);
+            }
+
+            _updateLock.Release();
+        }
+    }
+
+    private async Task DownloadTelegramUpdatePackageAsync(
+        Document document,
+        string zipPath,
+        CancellationToken cancellationToken)
+    {
+        if (document.FileSize > MaxUpdatePackageBytes)
+        {
+            throw new InvalidOperationException(
+                $"Update package is too large. Maximum allowed size is {FormatBytes(MaxUpdatePackageBytes)}.");
+        }
+
+        using CancellationTokenSource timeout =
+            CreateTimeoutTokenSource(cancellationToken, UpdateDownloadTimeout);
+
+        TGFile telegramFile = await _botClient.GetFile(document.FileId, timeout.Token);
+
+        await using FileStream destination = File.Create(zipPath);
+        await _botClient.DownloadFile(telegramFile, destination, timeout.Token);
+
+        EnsureFileWithinUpdateSizeLimit(zipPath);
+    }
+
+    private async Task DownloadUrlUpdatePackageAsync(
+        Uri updateUri,
+        string zipPath,
+        CancellationToken cancellationToken)
+    {
+        using CancellationTokenSource timeout =
+            CreateTimeoutTokenSource(cancellationToken, UpdateDownloadTimeout);
+
+        using HttpClient httpClient = _httpClientFactory.CreateClient();
+        httpClient.Timeout = Timeout.InfiniteTimeSpan;
+
+        using HttpResponseMessage response = await httpClient.GetAsync(
+            updateUri,
+            HttpCompletionOption.ResponseHeadersRead,
+            timeout.Token);
+
+        response.EnsureSuccessStatusCode();
+
+        long? contentLength = response.Content.Headers.ContentLength;
+        if (contentLength > MaxUpdatePackageBytes)
+        {
+            throw new InvalidOperationException(
+                $"Update package is too large. Maximum allowed size is {FormatBytes(MaxUpdatePackageBytes)}.");
+        }
+
+        await using Stream source = await response.Content.ReadAsStreamAsync(timeout.Token);
+        await using FileStream destination = File.Create(zipPath);
+        await CopyStreamWithLimitAsync(source, destination, MaxUpdatePackageBytes, timeout.Token);
+
+        EnsureFileWithinUpdateSizeLimit(zipPath);
+    }
+
+    private static async Task CopyStreamWithLimitAsync(
+        Stream source,
+        Stream destination,
+        long maxBytes,
+        CancellationToken cancellationToken)
+    {
+        byte[] buffer = new byte[81920];
+        long totalBytes = 0;
+
+        while (true)
+        {
+            int bytesRead = await source.ReadAsync(buffer, cancellationToken);
+            if (bytesRead == 0)
+            {
+                return;
+            }
+
+            totalBytes += bytesRead;
+            if (totalBytes > maxBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Update package is too large. Maximum allowed size is {FormatBytes(maxBytes)}.");
+            }
+
+            await destination.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+        }
+    }
+
+    private static Task ExtractUpdatePackageAsync(
+        string zipPath,
+        string extractRoot,
+        CancellationToken cancellationToken)
+    {
+        return Task.Run(
+            () =>
+            {
+                string fullExtractRoot = EnsureTrailingDirectorySeparator(Path.GetFullPath(extractRoot));
+
+                using ZipArchive archive = ZipFile.OpenRead(zipPath);
+                if (archive.Entries.Count == 0)
+                {
+                    throw new InvalidOperationException("Update package is empty.");
+                }
+
+                foreach (ZipArchiveEntry entry in archive.Entries)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (string.IsNullOrWhiteSpace(entry.FullName))
+                    {
+                        continue;
+                    }
+
+                    string destinationPath = Path.GetFullPath(Path.Combine(extractRoot, entry.FullName));
+                    if (!IsPathWithinDirectory(destinationPath, fullExtractRoot))
+                    {
+                        throw new InvalidOperationException(
+                            $"Update package contains an unsafe path: {entry.FullName}");
+                    }
+
+                    if (string.IsNullOrEmpty(entry.Name))
+                    {
+                        Directory.CreateDirectory(destinationPath);
+                        continue;
+                    }
+
+                    Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+                    entry.ExtractToFile(destinationPath, overwrite: true);
+                }
+            },
+            cancellationToken);
+    }
+
+    private static string ResolveUpdatePayloadRoot(string extractRoot)
+    {
+        string[] rootFiles = Directory.GetFiles(extractRoot);
+        string[] rootDirectories = Directory.GetDirectories(extractRoot);
+
+        if (rootFiles.Length == 0 && rootDirectories.Length == 1)
+        {
+            return rootDirectories[0];
+        }
+
+        return extractRoot;
+    }
+
+    private static void ValidateUpdatePayloadRoot(string payloadRoot)
+    {
+        string expectedExecutableName = Path.GetFileName(GetCurrentExecutablePath());
+        string expectedExecutablePath = Path.Combine(payloadRoot, expectedExecutableName);
+
+        if (!File.Exists(expectedExecutablePath))
+        {
+            throw new InvalidOperationException(
+                $"Update package must contain {expectedExecutableName} at the payload root.");
+        }
+    }
+
+    private static async Task WriteUpdaterScriptAsync(
+        string scriptPath,
+        UpdaterScriptOptions options,
+        CancellationToken cancellationToken)
+    {
+        string script = BuildUpdaterScript(options);
+        await File.WriteAllTextAsync(
+            scriptPath,
+            script,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            cancellationToken);
+    }
+
+    private static void LaunchUpdaterScript(string scriptPath)
+    {
+        StartDetachedProcess(
+            GetWindowsPowerShellPath(),
+            $"-NoProfile -ExecutionPolicy Bypass -File {QuoteCommandLineArgument(scriptPath)}");
     }
 
     private static string GetCommandPayload(string commandText)
@@ -1502,9 +1828,270 @@ public sealed class Worker : BackgroundService
             """;
     }
 
+    private static string BuildUpdaterScript(UpdaterScriptOptions options)
+    {
+        string encodedServiceName = EncodeUtf8Base64(options.ServiceName);
+        string encodedPayloadRoot = EncodeUtf8Base64(options.PayloadRoot);
+        string encodedTargetDirectory = EncodeUtf8Base64(options.TargetDirectory);
+        string encodedBackupDirectory = EncodeUtf8Base64(options.BackupDirectory);
+        string encodedUpdateRoot = EncodeUtf8Base64(options.UpdateRoot);
+        string encodedStatusMarkerPath = EncodeUtf8Base64(options.StatusMarkerPath);
+        string encodedLogPath = EncodeUtf8Base64(options.LogPath);
+
+        return $$"""
+            $ErrorActionPreference = 'Stop'
+
+            function Decode-Base64Utf8([string]$value) {
+                return [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($value))
+            }
+
+            $ServiceName = Decode-Base64Utf8 '{{encodedServiceName}}'
+            $TargetProcessId = {{options.ProcessId}}
+            $PayloadRoot = Decode-Base64Utf8 '{{encodedPayloadRoot}}'
+            $TargetDirectory = Decode-Base64Utf8 '{{encodedTargetDirectory}}'
+            $BackupDirectory = Decode-Base64Utf8 '{{encodedBackupDirectory}}'
+            $UpdateRoot = Decode-Base64Utf8 '{{encodedUpdateRoot}}'
+            $StatusMarkerPath = Decode-Base64Utf8 '{{encodedStatusMarkerPath}}'
+            $LogPath = Decode-Base64Utf8 '{{encodedLogPath}}'
+            $ConfigFileName = '{{ConfigFileName}}'
+            $PathTrimChars = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+
+            function Write-Log([string]$message) {
+                $line = "$(Get-Date -Format o) $message"
+                $logDirectory = [System.IO.Path]::GetDirectoryName($LogPath)
+                if (-not [string]::IsNullOrWhiteSpace($logDirectory)) {
+                    New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+                }
+
+                Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+            }
+
+            function Write-UpdateStatus([string]$message) {
+                $statusDirectory = [System.IO.Path]::GetDirectoryName($StatusMarkerPath)
+                if (-not [string]::IsNullOrWhiteSpace($statusDirectory)) {
+                    New-Item -ItemType Directory -Path $statusDirectory -Force | Out-Null
+                }
+
+                Set-Content -LiteralPath $StatusMarkerPath -Value $message -Encoding UTF8
+            }
+
+            function Invoke-Retry([scriptblock]$action, [string]$description) {
+                $lastError = $null
+
+                for ($attempt = 1; $attempt -le 30; $attempt++) {
+                    try {
+                        & $action
+                        return
+                    }
+                    catch {
+                        $lastError = $_
+                        Write-Log "$description failed on attempt ${attempt}: $($_.Exception.Message)"
+
+                        if ($attempt -lt 30) {
+                            Start-Sleep -Seconds 2
+                        }
+                    }
+                }
+
+                throw "Failed to complete '$description' after 30 attempts. Last error: $($lastError.Exception.Message)"
+            }
+
+            function Copy-Tree([string]$source, [string]$destination) {
+                if (-not (Test-Path -LiteralPath $source)) {
+                    throw "Source path does not exist: $source"
+                }
+
+                New-Item -ItemType Directory -Path $destination -Force | Out-Null
+
+                Get-ChildItem -LiteralPath $source -Recurse -Directory -Force | ForEach-Object {
+                    $relative = $_.FullName.Substring($source.Length).TrimStart($PathTrimChars)
+                    if (-not [string]::IsNullOrWhiteSpace($relative)) {
+                        New-Item -ItemType Directory -Path (Join-Path $destination $relative) -Force | Out-Null
+                    }
+                }
+
+                Get-ChildItem -LiteralPath $source -Recurse -File -Force | Where-Object {
+                    -not $_.Name.Equals($ConfigFileName, [System.StringComparison]::OrdinalIgnoreCase)
+                } | ForEach-Object {
+                    $file = $_
+                    $relative = $file.FullName.Substring($source.Length).TrimStart($PathTrimChars)
+                    $targetPath = Join-Path $destination $relative
+                    $targetParent = [System.IO.Path]::GetDirectoryName($targetPath)
+
+                    if (-not [string]::IsNullOrWhiteSpace($targetParent)) {
+                        New-Item -ItemType Directory -Path $targetParent -Force | Out-Null
+                    }
+
+                    Invoke-Retry { Copy-Item -LiteralPath $file.FullName -Destination $targetPath -Force } "copy $relative"
+                }
+            }
+
+            function Wait-ForOriginalProcessExit {
+                Start-Sleep -Seconds 3
+                & sc.exe stop $ServiceName | Out-Null
+
+                $deadline = (Get-Date).AddSeconds(90)
+                while ((Get-Process -Id $TargetProcessId -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+                    Start-Sleep -Seconds 1
+                }
+
+                if (Get-Process -Id $TargetProcessId -ErrorAction SilentlyContinue) {
+                    throw "Original service process $TargetProcessId did not exit before timeout."
+                }
+            }
+
+            function Start-TargetService {
+                & sc.exe start $ServiceName | Out-Null
+                Write-Log "Service start requested."
+            }
+
+            try {
+                Write-Log "OTA update script started."
+                Wait-ForOriginalProcessExit
+
+                if (Test-Path -LiteralPath $BackupDirectory) {
+                    Remove-Item -LiteralPath $BackupDirectory -Recurse -Force -ErrorAction SilentlyContinue
+                }
+
+                New-Item -ItemType Directory -Path $BackupDirectory -Force | Out-Null
+
+                Write-Log "Backing up current service files."
+                Copy-Tree -source $TargetDirectory -destination $BackupDirectory
+
+                Write-Log "Copying staged update files."
+                Copy-Tree -source $PayloadRoot -destination $TargetDirectory
+
+                Write-UpdateStatus "✅ OTA update applied successfully at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')."
+                Start-TargetService
+                Write-Log "OTA update completed successfully."
+            }
+            catch {
+                $failureMessage = $_.Exception.Message
+                Write-Log "OTA update failed: $failureMessage"
+
+                try {
+                    if (Test-Path -LiteralPath $BackupDirectory) {
+                        Write-Log "Attempting rollback from backup."
+                        Copy-Tree -source $BackupDirectory -destination $TargetDirectory
+                        Write-UpdateStatus "⚠️ OTA update failed and rollback was attempted at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'). Error: $failureMessage"
+                    }
+                    else {
+                        Write-UpdateStatus "⚠️ OTA update failed before backup was created at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'). Error: $failureMessage"
+                    }
+                }
+                catch {
+                    Write-UpdateStatus "🚨 OTA update failed and rollback also failed at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'). Update error: $failureMessage Rollback error: $($_.Exception.Message)"
+                    Write-Log "Rollback failed: $($_.Exception.Message)"
+                }
+
+                try {
+                    Start-TargetService
+                }
+                catch {
+                    Write-Log "Service restart failed after update failure: $($_.Exception.Message)"
+                }
+            }
+            finally {
+                try {
+                    if (Test-Path -LiteralPath $UpdateRoot) {
+                        Remove-Item -LiteralPath $UpdateRoot -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
+                catch {
+                    Write-Log "Failed to delete update staging directory: $($_.Exception.Message)"
+                }
+
+                $scriptPath = $MyInvocation.MyCommand.Path
+                $escapedScriptPath = $scriptPath.Replace("'", "''")
+                $cleanupScript = "Start-Sleep -Seconds 5; Remove-Item -LiteralPath '$escapedScriptPath' -Force -ErrorAction SilentlyContinue"
+                $cleanupBytes = [System.Text.Encoding]::Unicode.GetBytes($cleanupScript)
+                $cleanupEncoded = [System.Convert]::ToBase64String($cleanupBytes)
+                Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $cleanupEncoded" -WindowStyle Hidden
+            }
+            """;
+    }
+
     private static string EncodeUtf8Base64(string value)
     {
         return Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+    }
+
+    private static bool IsZipFileName(string? fileName)
+    {
+        return !string.IsNullOrWhiteSpace(fileName) &&
+            Path.GetExtension(fileName).Equals(ZipExtension, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryParseUpdateUri(string urlText, out Uri? uri, out string? error)
+    {
+        uri = null;
+        error = null;
+
+        if (!Uri.TryCreate(urlText, UriKind.Absolute, out Uri? parsedUri))
+        {
+            error = "provide an absolute HTTPS URL ending in .zip.";
+            return false;
+        }
+
+        if (!parsedUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            error = "only HTTPS update URLs are allowed.";
+            return false;
+        }
+
+        if (!Path.GetExtension(parsedUri.AbsolutePath).Equals(ZipExtension, StringComparison.OrdinalIgnoreCase))
+        {
+            error = "update URL must point to a .zip file.";
+            return false;
+        }
+
+        uri = parsedUri;
+        return true;
+    }
+
+    private static void EnsureFileWithinUpdateSizeLimit(string path)
+    {
+        FileInfo file = new(path);
+        if (!file.Exists || file.Length == 0)
+        {
+            throw new InvalidOperationException("Update package download produced an empty file.");
+        }
+
+        if (file.Length > MaxUpdatePackageBytes)
+        {
+            throw new InvalidOperationException(
+                $"Update package is too large. Maximum allowed size is {FormatBytes(MaxUpdatePackageBytes)}.");
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        return $"{bytes / 1024d / 1024d:N1} MB";
+    }
+
+    private static string EnsureTrailingDirectorySeparator(string directory)
+    {
+        return directory.EndsWith(Path.DirectorySeparatorChar) ||
+            directory.EndsWith(Path.AltDirectorySeparatorChar)
+            ? directory
+            : directory + Path.DirectorySeparatorChar;
+    }
+
+    private static bool IsPathWithinDirectory(string path, string directory)
+    {
+        string fullPath = Path.GetFullPath(path);
+        string fullDirectory = EnsureTrailingDirectorySeparator(Path.GetFullPath(directory));
+        return fullPath.StartsWith(fullDirectory, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string QuoteCommandLineArgument(string value)
+    {
+        return $"\"{value.Replace("\"", "\\\"", StringComparison.Ordinal)}\"";
+    }
+
+    private static string GetUpdateStatusMarkerPath()
+    {
+        return Path.Combine(GetSharedTempDirectory("Updates"), UpdateStatusMarkerFileName);
     }
 
     private static string NormalizeProcessName(string processName)
@@ -1529,6 +2116,23 @@ public sealed class Worker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to delete temporary file {TempFile}.", tempFile);
+        }
+    }
+
+    private void DeleteDirectorySafe(string? directory)
+    {
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+        {
+            return;
+        }
+
+        try
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to delete temporary directory {Directory}.", directory);
         }
     }
 
@@ -1731,6 +2335,7 @@ public sealed class Worker : BackgroundService
             new BotCommand { Command = "screen", Description = "Capture the screen" },
             new BotCommand { Command = "tasks", Description = "Show top processes" },
             new BotCommand { Command = "kill", Description = "Terminate a process" },
+            new BotCommand { Command = "update", Description = "Apply an OTA update" },
             new BotCommand { Command = "help", Description = "Show available commands" },
             new BotCommand { Command = "stop", Description = "Stop the service" },
             new BotCommand { Command = "uninstall", Description = "Stop and delete the service" }
@@ -2136,6 +2741,16 @@ public sealed class Worker : BackgroundService
     }
 
     private readonly record struct MicCommand(int DurationSeconds, bool Loop, bool Stop);
+
+    private readonly record struct UpdaterScriptOptions(
+        string ServiceName,
+        int ProcessId,
+        string PayloadRoot,
+        string TargetDirectory,
+        string BackupDirectory,
+        string UpdateRoot,
+        string StatusMarkerPath,
+        string LogPath);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SystemPowerStatus

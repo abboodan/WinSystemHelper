@@ -15,6 +15,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 - Session 0-aware command execution for workstation lock and alert sound behavior using active-user-session process launching.
 - Interactive active-user prompts using Base64-encoded PowerShell UI scripts.
 - Overt active-alarm microphone recording with local visual/audio warnings.
+- Admin-only OTA self-update from a Telegram ZIP document or HTTPS ZIP URL.
 - Emoji-rich Telegram responses with a native Telegram command menu.
 - Local configuration through `config.json` stored beside the executable.
 
@@ -39,6 +40,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/screen` | Captures the active user's primary screen and returns the image. |
 | `/tasks` | Lists the top memory-consuming processes. |
 | `/kill [ProcessName]` | Terminates matching process instances by name. |
+| `/update [https-url]` | Applies an OTA update from an attached ZIP document or HTTPS ZIP URL. |
 | `/help` | Shows the available remote commands. |
 | `/stop` | Stops the WinSystemHelper service. |
 | `/uninstall` | Stops and deletes the WinSystemHelper service. |
@@ -121,6 +123,24 @@ The current configuration format supports multiple Telegram admins:
 ```
 
 Older single-admin `adminChatId` configurations are still accepted for compatibility, but new installs and the setup wizard write `adminChatIds`.
+
+## OTA Self-Update
+
+Authorized admins can update an endpoint remotely with a ZIP package:
+
+```text
+/update https://example.com/update.zip
+```
+
+Or attach a `.zip` file in Telegram with this caption:
+
+```text
+/update
+```
+
+The ZIP may contain the published files directly at its root or inside one top-level folder. The service stages and extracts the package, preserves the existing `config.json`, stops itself, copies the new files into `AppContext.BaseDirectory`, restarts the `WinSystemHelper` service, and reports the result to all configured admins on the next startup.
+
+Updates use the existing admin chat allowlist as the trust boundary. The updater creates a backup before copying files and attempts rollback if the copy fails.
 
 ## Security Disclaimer
 
