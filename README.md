@@ -16,6 +16,9 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 - Interactive active-user prompts using Base64-encoded PowerShell UI scripts.
 - Overt active-alarm microphone recording with local visual/audio warnings.
 - Admin-only OTA self-update from a Telegram ZIP document or HTTPS ZIP URL.
+- Confirmation gates and cooldowns for dangerous remote commands.
+- Lightweight health, network, service, disk, battery, and public-IP monitoring without WMI-heavy polling.
+- Runtime configuration and admin management through Telegram without reinstalling the service.
 - Emoji-rich Telegram responses with a native Telegram command menu.
 - Local configuration through `config.json` stored beside the executable.
 
@@ -24,12 +27,17 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | Command | Description |
 | --- | --- |
 | `/status` | Shows the full low-overhead system, runtime, service, battery, and wake watcher dashboard. |
+| `/healthcheck` | Shows a fast health summary with cached state and recent failures. |
 | `/version` | Shows the installed WinSystemHelper version. |
+| `/confirm [Id]` | Confirms a pending dangerous command. |
+| `/cancel [Id]` | Cancels a pending dangerous command. |
 | `/lock` | Locks the active Windows workstation. |
-| `/shutdown` | Initiates a graceful shutdown after 10 seconds. |
-| `/restart` | Initiates a system restart after 10 seconds. |
-| `/sleep` | Puts the workstation to sleep. |
-| `/ip` | Returns the current public IP address. |
+| `/shutdown` | Requests confirmation before graceful shutdown after 10 seconds. |
+| `/restart` | Requests confirmation before system restart after 10 seconds. |
+| `/sleep` | Requests confirmation before putting the workstation to sleep. |
+| `/ip` | Returns the cached public IP or refreshes it with a short timeout. |
+| `/ip refresh` | Forces a public IP refresh subject to timeout and backoff. |
+| `/net` | Shows active local adapters, local IPs, gateways, DNS, and cached public IP. |
 | `/alarm` | Plays a system alert sound through the active user session. |
 | `/mic [seconds]` | Triggers an overt active alarm and returns an audio recording. |
 | `/mic [seconds] loop` | Starts a persistent overt active alarm loop. |
@@ -43,10 +51,16 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/kill [ProcessName]` | Terminates matching process instances by name. |
 | `/startup` | Lists startup applications from machine and active-user registry run keys. |
 | `/restartapp [ProcessName]` | Restarts a target app in the active user's visible session. |
+| `/services` | Lists Windows services. |
+| `/service status\|start\|stop\|restart [ServiceName]` | Queries or manages a Windows service. |
+| `/config` | Shows safe runtime configuration without exposing the bot token. |
+| `/config set [Key] [Value]` | Updates runtime configuration in `config.json`. |
+| `/config admins` | Lists configured Telegram admins. |
+| `/config admin add\|remove [ChatId]` | Adds or removes Telegram admins without reinstalling. |
 | `/update [https-url]` | Applies an OTA update from an attached ZIP document or HTTPS ZIP URL. |
 | `/help` | Shows the available remote commands. |
-| `/stop` | Stops the WinSystemHelper service. |
-| `/uninstall` | Stops and deletes the WinSystemHelper service. |
+| `/stop` | Requests confirmation before stopping the WinSystemHelper service. |
+| `/uninstall` | Requests confirmation before stopping and deleting the WinSystemHelper service. |
 
 ## Build
 
@@ -61,6 +75,16 @@ The published executable will be under:
 ```text
 bin\Release\net8.0-windows\win-x64\publish\
 ```
+
+## Versioning
+
+The project uses semantic versioning in `WinSystemHelper.csproj`. Each functional change should bump the version according to impact:
+
+- Patch: small fixes and low-risk internal corrections.
+- Minor: new commands, configuration options, alerts, or remote-management features.
+- Major: breaking configuration changes or behavior changes that require operator action.
+
+Current version: `1.1.0`.
 
 ## Installation
 
@@ -126,6 +150,18 @@ The current configuration format supports multiple Telegram admins:
 ```
 
 Older single-admin `adminChatId` configurations are still accepted for compatibility, but new installs and the setup wizard write `adminChatIds`.
+
+Runtime settings can be changed through Telegram without reinstalling:
+
+```text
+/config set BatteryLowPercent 15
+/config set AlertsEnabled true
+/config admin add 333333333
+```
+
+Supported runtime keys include `AlertsEnabled`, `BatteryLowPercent`, `DiskLowPercent`, `HealthCheckIntervalMinutes`, `PublicIpCacheMinutes`, `PublicIpFailureBackoffMinutes`, `DangerousCommandConfirmationSeconds`, `DangerousCommandCooldownSeconds`, `ScreenshotCooldownSeconds`, `MicCooldownSeconds`, and `AllowCrossAdminConfirmations`.
+
+Dangerous commands such as shutdown, restart, sleep, update, process termination, service control, stop, and uninstall require `/confirm [Id]` before execution.
 
 ## OTA Self-Update
 

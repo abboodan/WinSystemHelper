@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.ComponentModel;
 using System.Diagnostics.Eventing.Reader;
@@ -6,8 +7,11 @@ using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Security.Cryptography;
 using System.Security.Principal;
+using System.ServiceProcess;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Win32;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot;
@@ -30,8 +34,13 @@ public sealed class Worker : BackgroundService
     private static readonly TimeSpan TextPromptTimeout = TimeSpan.FromSeconds(120);
     private static readonly TimeSpan ScreenshotTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan UpdateDownloadTimeout = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan PublicIpRefreshTimeout = TimeSpan.FromSeconds(3);
     private static readonly Uri TelegramApiBaseUri = new("https://api.telegram.org");
     private static readonly Uri PublicIpUri = new("https://api.ipify.org");
+    private static readonly JsonSerializerOptions ConfigurationJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = true
+    };
     private const long MaxUpdatePackageBytes = 100L * 1024L * 1024L;
     private const int TelegramUpdateLimit = 20;
     private const int DefaultMicRecordingSeconds = 10;
@@ -102,11 +111,17 @@ public sealed class Worker : BackgroundService
     private readonly ITelegramBotClient _botClient;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IHostApplicationLifetime _hostLifetime;
-    private readonly HashSet<long> _adminChatIds;
+    private readonly object _configurationSync = new();
+    private long[] _adminChatIds;
     private readonly AsyncLocal<long?> _replyChatId = new();
     private readonly SemaphoreSlim _resumeNotificationLock = new(1, 1);
     private readonly SemaphoreSlim _micRecordingLock = new(1, 1);
     private readonly SemaphoreSlim _updateLock = new(1, 1);
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _cooldowns = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<int, PendingConfirmation> _pendingConfirmations = new();
+    private readonly object _publicIpSync = new();
+    private readonly object _telemetrySync = new();
+    private readonly object _alertStateSync = new();
     private readonly object _micLoopSync = new();
     private readonly object _wakeEventWatcherSync = new();
     private readonly CancellationTokenSource _serviceStopping = new();
@@ -114,7 +129,24 @@ public sealed class Worker : BackgroundService
     private readonly Stopwatch _uptime = Stopwatch.StartNew();
     private CancellationTokenSource? _micLoopCts;
     private EventLogWatcher? _wakeEventWatcher;
+    private string? _cachedPublicIp;
+    private DateTimeOffset? _publicIpFetchedAt;
+    private DateTimeOffset? _publicIpNextAttemptAt;
+    private DateTimeOffset? _lastPollingSuccessAt;
+    private DateTimeOffset? _lastPollingFailureAt;
+    private DateTimeOffset? _lastWakeAlertAt;
+    private DateTimeOffset? _lastStartupAlertAt;
+    private DateTimeOffset? _lastSmartAlertAt;
+    private string? _lastError;
+    private string? _lastPublicIpAlerted;
+    private DateTimeOffset? _micLoopStartedAt;
     private long _lastWakeEventRecordId;
+    private int _telegramPollingFailureStreak;
+    private int _publicIpFailureCount;
+    private bool _batteryLowAlertActive;
+    private bool _diskLowAlertActive;
+    private bool _micLoopLongAlertSent;
+    private bool _repeatedTelegramFailureAlertActive;
 
     public Worker(
         ILogger<Worker> logger,
@@ -128,9 +160,7 @@ public sealed class Worker : BackgroundService
         _botClient = botClient;
         _httpClientFactory = httpClientFactory;
         _hostLifetime = hostLifetime;
-        _adminChatIds = configuration.GetEffectiveAdminChatIds()
-            .Where(chatId => chatId != 0)
-            .ToHashSet();
+        _adminChatIds = NormalizeAdminChatIds(configuration.GetEffectiveAdminChatIds());
     }
 
     public override Task StartAsync(CancellationToken cancellationToken)
@@ -162,6 +192,7 @@ public sealed class Worker : BackgroundService
 
         QueueBackgroundWork(SendPendingUpdateStatusAsync, "Update status report failed.");
         QueueBackgroundWork(SendStartupAlertAsync, "Startup alert failed.");
+        QueueBackgroundWork(RunSmartAlertLoopAsync, "Smart alert loop failed.");
         await RegisterTelegramMenuAsync(workerStopping.Token);
 
         var offset = 0;
@@ -182,6 +213,7 @@ public sealed class Worker : BackgroundService
                     cancellationToken: pollingTimeout.Token);
 
                 pollingFailureAttempt = 0;
+                RecordPollingSuccess();
 
                 foreach (Update update in updates)
                 {
@@ -225,7 +257,8 @@ public sealed class Worker : BackgroundService
 
     private async Task<bool> ValidateConfigurationOrStopAsync(CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(_configuration.BotToken) || _adminChatIds.Count == 0)
+        long[] adminChatIds = GetAdminChatIdsSnapshot();
+        if (string.IsNullOrWhiteSpace(_configuration.BotToken) || adminChatIds.Length == 0)
         {
             _logger.LogCritical(
                 "Fatal configuration error: BotToken or AdminChatIds is missing in config.json. The service will stop.");
@@ -244,7 +277,7 @@ public sealed class Worker : BackgroundService
                 CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
             User bot = await _botClient.GetMe(botTimeout.Token);
 
-            foreach (long adminChatId in _adminChatIds)
+            foreach (long adminChatId in adminChatIds)
             {
                 using CancellationTokenSource chatTimeout =
                     CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
@@ -257,7 +290,7 @@ public sealed class Worker : BackgroundService
             _logger.LogInformation(
                 "Telegram configuration validated for bot @{BotUsername} and {AdminChatCount} admin chat(s).",
                 bot.Username,
-                _adminChatIds.Count);
+                adminChatIds.Length);
 
             return true;
         }
@@ -296,6 +329,11 @@ public sealed class Worker : BackgroundService
         await SendTelegramBroadcastWithRetryAsync(
             $"🚀 Startup/Boot Alert: {machineName} booted up at {timestamp}. User: {userName}.",
             cancellationToken);
+
+        lock (_telemetrySync)
+        {
+            _lastStartupAlertAt = DateTimeOffset.Now;
+        }
 
         _logger.LogInformation("Startup alert sent.");
     }
@@ -460,6 +498,11 @@ public sealed class Worker : BackgroundService
                 $"🔔 Administrative alert: {machineName} resumed from sleep at {timestamp}. User: {userName}.",
                 cancellationToken);
 
+            lock (_telemetrySync)
+            {
+                _lastWakeAlertAt = DateTimeOffset.Now;
+            }
+
             _logger.LogInformation("Wake alert sent.");
         }
         finally
@@ -477,7 +520,7 @@ public sealed class Worker : BackgroundService
 
         // Security boundary: do not inspect or respond to commands from any non-admin chat.
         long chatId = message.Chat.Id;
-        if (!_adminChatIds.Contains(chatId))
+        if (!IsAdminChatId(chatId))
         {
             return;
         }
@@ -504,23 +547,47 @@ public sealed class Worker : BackgroundService
                 case "/status":
                     await SendStatusAsync(cancellationToken);
                     break;
+                case "/healthcheck":
+                    await SendHealthCheckAsync(cancellationToken);
+                    break;
                 case "/version":
                     await SendVersionAsync(cancellationToken);
+                    break;
+                case "/confirm":
+                    await ConfirmPendingCommandAsync(text, chatId, cancellationToken);
+                    break;
+                case "/cancel":
+                    await CancelPendingCommandAsync(text, chatId, cancellationToken);
                     break;
                 case "/lock":
                     await LockWorkstationAsync(cancellationToken);
                     break;
                 case "/shutdown":
-                    await ShutdownAsync(cancellationToken);
+                    await RequestDangerousConfirmationAsync(
+                        "shutdown",
+                        "Shut down this PC in 10 seconds",
+                        ShutdownAsync,
+                        cancellationToken);
                     break;
                 case "/restart":
-                    await RestartAsync(cancellationToken);
+                    await RequestDangerousConfirmationAsync(
+                        "restart",
+                        "Restart this PC in 10 seconds",
+                        RestartAsync,
+                        cancellationToken);
                     break;
                 case "/sleep":
-                    await SleepAsync(cancellationToken);
+                    await RequestDangerousConfirmationAsync(
+                        "sleep",
+                        "Put this PC to sleep",
+                        SleepAsync,
+                        cancellationToken);
                     break;
                 case "/ip":
-                    await SendPublicIpAsync(cancellationToken);
+                    await HandlePublicIpCommandAsync(text, cancellationToken);
+                    break;
+                case "/net":
+                    await SendNetworkReportAsync(cancellationToken);
                     break;
                 case "/alarm":
                     await TriggerAlarmAsync(cancellationToken);
@@ -547,22 +614,39 @@ public sealed class Worker : BackgroundService
                     HandleTasksCommand();
                     break;
                 case "/kill":
-                    await HandleKillCommandAsync(text, cancellationToken);
+                    await HandleKillCommandRequestAsync(text, cancellationToken);
                     break;
                 case "/startup":
                     await SendStartupAppsAsync(cancellationToken);
                     break;
                 case "/restartapp":
-                    await HandleRestartAppCommandAsync(text, cancellationToken);
+                    await HandleRestartAppCommandRequestAsync(text, cancellationToken);
+                    break;
+                case "/services":
+                    HandleServicesCommand();
+                    break;
+                case "/service":
+                    await HandleServiceCommandAsync(text, cancellationToken);
+                    break;
+                case "/config":
+                    await HandleConfigCommandAsync(text, chatId, cancellationToken);
                     break;
                 case "/update":
-                    await HandleUpdateCommandAsync(message, text, chatId, cancellationToken);
+                    await HandleUpdateCommandRequestAsync(message, text, chatId, cancellationToken);
                     break;
                 case "/stop":
-                    await StopServiceAsync(cancellationToken);
+                    await RequestDangerousConfirmationAsync(
+                        "stop",
+                        "Stop the WinSystemHelper service",
+                        StopServiceAsync,
+                        cancellationToken);
                     break;
                 case "/uninstall":
-                    await UninstallServiceRemotelyAsync(cancellationToken);
+                    await RequestDangerousConfirmationAsync(
+                        "uninstall",
+                        "Stop and delete the WinSystemHelper service",
+                        UninstallServiceRemotelyAsync,
+                        cancellationToken);
                     break;
             }
         }
@@ -616,6 +700,32 @@ public sealed class Worker : BackgroundService
             $"Active console session: {SafeStatusMetric("active console session", GetActiveConsoleSessionStatus)}",
             $"Wake watcher: {GetWakeWatcherStatus()}",
             $"Mic loop: {GetMicLoopStatus()}",
+            $"Timestamp: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+
+        await SendTelegramMessageOnceAsync(status, cancellationToken);
+    }
+
+    private async Task SendHealthCheckAsync(CancellationToken cancellationToken)
+    {
+        TelemetrySnapshot telemetry = GetTelemetrySnapshot();
+        PublicIpSnapshot publicIp = GetPublicIpSnapshot();
+        int pendingConfirmations = RemoveExpiredConfirmations();
+
+        string status = string.Join(
+            Environment.NewLine,
+            "🩺 WinSystemHelper Healthcheck:",
+            $"Service uptime: {FormatDuration(_uptime.Elapsed)}",
+            $"Network available: {SafeStatusMetric("network availability", () => NetworkInterface.GetIsNetworkAvailable().ToString())}",
+            $"Last poll OK: {FormatNullableTimestamp(telemetry.LastPollingSuccessAt)}",
+            $"Last poll failure: {FormatNullableTimestamp(telemetry.LastPollingFailureAt)}",
+            $"Polling failure streak: {telemetry.PollingFailureStreak}",
+            $"Last wake alert: {FormatNullableTimestamp(telemetry.LastWakeAlertAt)}",
+            $"Last startup alert: {FormatNullableTimestamp(telemetry.LastStartupAlertAt)}",
+            $"Public IP cache: {FormatPublicIpSnapshot(publicIp)}",
+            $"Wake watcher: {GetWakeWatcherStatus()}",
+            $"Mic loop: {GetMicLoopStatus()}",
+            $"Pending confirmations: {pendingConfirmations}",
+            $"Last error: {telemetry.LastError ?? "None"}",
             $"Timestamp: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
 
         await SendTelegramMessageOnceAsync(status, cancellationToken);
@@ -684,6 +794,88 @@ public sealed class Worker : BackgroundService
         }
     }
 
+    private TelemetrySnapshot GetTelemetrySnapshot()
+    {
+        lock (_telemetrySync)
+        {
+            return new TelemetrySnapshot(
+                _lastPollingSuccessAt,
+                _lastPollingFailureAt,
+                _lastWakeAlertAt,
+                _lastStartupAlertAt,
+                _lastSmartAlertAt,
+                _lastError,
+                _telegramPollingFailureStreak);
+        }
+    }
+
+    private PublicIpSnapshot GetPublicIpSnapshot()
+    {
+        lock (_publicIpSync)
+        {
+            return new PublicIpSnapshot(
+                _cachedPublicIp,
+                _publicIpFetchedAt,
+                _publicIpNextAttemptAt,
+                _publicIpFailureCount);
+        }
+    }
+
+    private void RecordPollingSuccess()
+    {
+        lock (_telemetrySync)
+        {
+            _lastPollingSuccessAt = DateTimeOffset.Now;
+            _telegramPollingFailureStreak = 0;
+        }
+
+        lock (_alertStateSync)
+        {
+            _repeatedTelegramFailureAlertActive = false;
+        }
+    }
+
+    private void RecordPollingFailure(Exception exception)
+    {
+        lock (_telemetrySync)
+        {
+            _lastPollingFailureAt = DateTimeOffset.Now;
+            _telegramPollingFailureStreak++;
+            _lastError = $"Telegram polling: {exception.GetType().Name}: {exception.Message}";
+        }
+    }
+
+    private void RecordError(string error)
+    {
+        lock (_telemetrySync)
+        {
+            _lastError = error;
+        }
+    }
+
+    private static string FormatNullableTimestamp(DateTimeOffset? timestamp)
+    {
+        return timestamp.HasValue
+            ? timestamp.Value.ToString("yyyy-MM-dd HH:mm:ss zzz")
+            : "Never";
+    }
+
+    private static string FormatPublicIpSnapshot(PublicIpSnapshot snapshot)
+    {
+        if (string.IsNullOrWhiteSpace(snapshot.PublicIp))
+        {
+            return snapshot.NextAttemptAt.HasValue
+                ? $"Unavailable; next attempt {snapshot.NextAttemptAt.Value:HH:mm:ss zzz}"
+                : "Unavailable";
+        }
+
+        string fetchedAt = snapshot.FetchedAt.HasValue
+            ? snapshot.FetchedAt.Value.ToString("HH:mm:ss zzz")
+            : "unknown time";
+
+        return $"{snapshot.PublicIp} fetched at {fetchedAt}";
+    }
+
     private static string FormatDuration(TimeSpan duration)
     {
         return duration.TotalDays >= 1
@@ -698,12 +890,17 @@ public sealed class Worker : BackgroundService
             "📜 Available Commands:",
             "",
             "/status - Show service, machine, network, and timestamp details.",
+            "/healthcheck - Show fast service health and cached state.",
             "/version - Show the installed WinSystemHelper version.",
+            "/confirm [Id] - Confirm a pending dangerous command.",
+            "/cancel [Id] - Cancel a pending dangerous command.",
             "/lock - Lock the Windows workstation.",
-            "/shutdown - Gracefully shut down the PC after 10 seconds.",
-            "/restart - 🔄 Restart the PC after 10 seconds.",
-            "/sleep - 🌙 Put the workstation to sleep.",
-            "/ip - Show the current public IP address.",
+            "/shutdown - Request shutdown confirmation.",
+            "/restart - 🔄 Request restart confirmation.",
+            "/sleep - 🌙 Request sleep confirmation.",
+            "/ip - Show the cached or refreshed public IP address.",
+            "/ip refresh - Force a public IP refresh with timeout/backoff.",
+            "/net - Show local network adapters, IPs, gateways, and DNS.",
             "/alarm - Play a system alert sound.",
             "/mic [seconds] - Trigger an overt alarm and record audio for up to 60 seconds.",
             "/mic [seconds] loop - Start a persistent overt active alarm loop.",
@@ -717,10 +914,16 @@ public sealed class Worker : BackgroundService
             "/kill [ProcessName] - 🔪 Terminate matching processes.",
             "/startup - 🚀 List configured startup applications.",
             "/restartapp [ProcessName] - 🔄 Restart an app in the active session.",
+            "/services - 🧩 List Windows services.",
+            "/service status|start|stop|restart [ServiceName] - 🧩 Manage a Windows service.",
+            "/config - ⚙️ Show safe runtime configuration.",
+            "/config set [Key] [Value] - ⚙️ Update runtime configuration.",
+            "/config admins - 👥 List configured admins.",
+            "/config admin add|remove [ChatId] - 👥 Manage admins without reinstall.",
             "/update [https-url] - 🔄 Apply an OTA update from a ZIP file or attached document.",
             "/help - Show this command list.",
-            "/stop - Stop the WinSystemHelper service.",
-            "/uninstall - Stop and delete the WinSystemHelper service.");
+            "/stop - Request WinSystemHelper service stop.",
+            "/uninstall - Request service uninstall.");
 
         await SendTelegramMessageOnceAsync(helpText, cancellationToken);
     }
@@ -734,6 +937,110 @@ public sealed class Worker : BackgroundService
             ?? "Unknown";
 
         await SendTelegramMessageOnceAsync($"🏷️ WinSystemHelper Version: {version}", cancellationToken);
+    }
+
+    private async Task RequestDangerousConfirmationAsync(
+        string commandKey,
+        string description,
+        Func<CancellationToken, Task> operation,
+        CancellationToken cancellationToken)
+    {
+        if (TryGetCooldownRemaining(commandKey, GetDangerousCommandCooldown(), out TimeSpan remaining))
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⏳ Command cooldown active. Try again in {FormatDurationForHumans(remaining)}.",
+                cancellationToken);
+            return;
+        }
+
+        RemoveExpiredConfirmations();
+
+        int confirmationId = CreateConfirmationId();
+        DateTimeOffset expiresAt = DateTimeOffset.Now.Add(GetDangerousCommandConfirmationTimeout());
+        long requesterChatId = GetReplyChatId();
+
+        _pendingConfirmations[confirmationId] = new PendingConfirmation(
+            confirmationId,
+            commandKey,
+            description,
+            requesterChatId,
+            expiresAt,
+            operation);
+
+        await SendTelegramMessageOnceAsync(
+            string.Join(
+                Environment.NewLine,
+                $"⚠️ Confirm required: {description}.",
+                $"Reply with /confirm {confirmationId} to proceed.",
+                $"Reply with /cancel {confirmationId} to cancel.",
+                $"Expires: {expiresAt:HH:mm:ss zzz}"),
+            cancellationToken);
+    }
+
+    private async Task ConfirmPendingCommandAsync(
+        string commandText,
+        long chatId,
+        CancellationToken cancellationToken)
+    {
+        if (!TryParseConfirmationId(commandText, out int confirmationId))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /confirm [Id]", cancellationToken);
+            return;
+        }
+
+        if (!_pendingConfirmations.TryRemove(confirmationId, out PendingConfirmation pending))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Confirmation was not found or already expired.", cancellationToken);
+            return;
+        }
+
+        if (pending.ExpiresAt <= DateTimeOffset.Now)
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Confirmation expired. Send the command again.", cancellationToken);
+            return;
+        }
+
+        if (!GetAllowCrossAdminConfirmations() && pending.RequesterChatId != chatId)
+        {
+            _pendingConfirmations[confirmationId] = pending;
+            await SendTelegramMessageOnceAsync("⚠️ This confirmation belongs to another admin.", cancellationToken);
+            return;
+        }
+
+        MarkCooldown(pending.CommandKey);
+
+        await SendTelegramMessageOnceAsync($"✅ Confirmed: {pending.Description}.", cancellationToken);
+
+        QueueBackgroundWork(
+            pending.Operation,
+            $"Confirmed command failed: {pending.CommandKey}.");
+    }
+
+    private async Task CancelPendingCommandAsync(
+        string commandText,
+        long chatId,
+        CancellationToken cancellationToken)
+    {
+        if (!TryParseConfirmationId(commandText, out int confirmationId))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /cancel [Id]", cancellationToken);
+            return;
+        }
+
+        if (!_pendingConfirmations.TryGetValue(confirmationId, out PendingConfirmation pending))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Confirmation was not found or already expired.", cancellationToken);
+            return;
+        }
+
+        if (!GetAllowCrossAdminConfirmations() && pending.RequesterChatId != chatId)
+        {
+            await SendTelegramMessageOnceAsync("⚠️ This confirmation belongs to another admin.", cancellationToken);
+            return;
+        }
+
+        _pendingConfirmations.TryRemove(confirmationId, out _);
+        await SendTelegramMessageOnceAsync($"🚫 Canceled: {pending.Description}.", cancellationToken);
     }
 
     private async Task LockWorkstationAsync(CancellationToken cancellationToken)
@@ -770,16 +1077,194 @@ public sealed class Worker : BackgroundService
         StartDetachedProcess("rundll32.exe", "powrprof.dll,SetSuspendState 0,1,0");
     }
 
-    private async Task SendPublicIpAsync(CancellationToken cancellationToken)
+    private async Task HandlePublicIpCommandAsync(string commandText, CancellationToken cancellationToken)
     {
-        using CancellationTokenSource timeout =
-            CreateTimeoutTokenSource(cancellationToken, ConnectivityProbeTimeout);
+        string payload = GetCommandPayload(commandText);
+        bool forceRefresh = payload.Equals("refresh", StringComparison.OrdinalIgnoreCase);
 
-        using HttpClient httpClient = _httpClientFactory.CreateClient();
-        httpClient.Timeout = Timeout.InfiniteTimeSpan;
+        if (!string.IsNullOrWhiteSpace(payload) && !forceRefresh)
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /ip or /ip refresh", cancellationToken);
+            return;
+        }
 
-        string publicIp = await httpClient.GetStringAsync(PublicIpUri, timeout.Token);
-        await SendTelegramMessageOnceAsync($"🌐 Public IP Address: {publicIp.Trim()}", cancellationToken);
+        if (forceRefresh &&
+            TryGetCooldownRemaining("ip-refresh", GetPublicIpFailureBackoff(), out TimeSpan remaining))
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⏳ Public IP refresh is cooling down. Try again in {FormatDurationForHumans(remaining)}.",
+                cancellationToken);
+            return;
+        }
+
+        PublicIpLookupResult result = await GetPublicIpAsync(forceRefresh, cancellationToken);
+
+        if (result.Success && !string.IsNullOrWhiteSpace(result.PublicIp))
+        {
+            await SendTelegramMessageOnceAsync(
+                $"🌐 Public IP Address: {result.PublicIp}{(result.FromCache ? " (cached)" : string.Empty)}",
+                cancellationToken);
+            return;
+        }
+
+        if (forceRefresh)
+        {
+            MarkCooldown("ip-refresh");
+        }
+
+        string staleText = string.IsNullOrWhiteSpace(result.StalePublicIp)
+            ? "No cached IP is available."
+            : $"Cached IP: {result.StalePublicIp}.";
+
+        await SendTelegramMessageOnceAsync(
+            $"⚠️ Public IP unavailable: {result.ErrorMessage ?? "request failed"}. {staleText}",
+            cancellationToken);
+    }
+
+    private async Task<PublicIpLookupResult> GetPublicIpAsync(
+        bool forceRefresh,
+        CancellationToken cancellationToken)
+    {
+        DateTimeOffset now = DateTimeOffset.Now;
+
+        lock (_publicIpSync)
+        {
+            if (!forceRefresh &&
+                !string.IsNullOrWhiteSpace(_cachedPublicIp) &&
+                _publicIpFetchedAt.HasValue &&
+                now - _publicIpFetchedAt.Value < GetPublicIpCacheDuration())
+            {
+                return PublicIpLookupResult.Cached(_cachedPublicIp, _publicIpFetchedAt.Value);
+            }
+
+            if (_publicIpNextAttemptAt.HasValue && _publicIpNextAttemptAt.Value > now)
+            {
+                return PublicIpLookupResult.Failed(
+                    $"backoff active until {_publicIpNextAttemptAt.Value:HH:mm:ss zzz}",
+                    _cachedPublicIp);
+            }
+        }
+
+        try
+        {
+            using CancellationTokenSource timeout =
+                CreateTimeoutTokenSource(cancellationToken, PublicIpRefreshTimeout);
+
+            using HttpClient httpClient = _httpClientFactory.CreateClient();
+            httpClient.Timeout = Timeout.InfiniteTimeSpan;
+
+            string publicIp = (await httpClient.GetStringAsync(PublicIpUri, timeout.Token)).Trim();
+            if (string.IsNullOrWhiteSpace(publicIp))
+            {
+                throw new InvalidOperationException("IP service returned an empty response.");
+            }
+
+            lock (_publicIpSync)
+            {
+                _cachedPublicIp = publicIp;
+                _publicIpFetchedAt = DateTimeOffset.Now;
+                _publicIpNextAttemptAt = null;
+                _publicIpFailureCount = 0;
+            }
+
+            return PublicIpLookupResult.Fresh(publicIp);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or InvalidOperationException)
+        {
+            string? staleIp;
+            lock (_publicIpSync)
+            {
+                _publicIpFailureCount++;
+                _publicIpNextAttemptAt = DateTimeOffset.Now.Add(GetPublicIpFailureBackoff());
+                staleIp = _cachedPublicIp;
+            }
+
+            RecordError($"Public IP lookup failed: {ex.Message}");
+            _logger.LogDebug(ex, "Public IP lookup failed.");
+
+            return PublicIpLookupResult.Failed(ex.Message, staleIp);
+        }
+    }
+
+    private async Task SendNetworkReportAsync(CancellationToken cancellationToken)
+    {
+        QueueBackgroundWork(SendNetworkReportCoreAsync, "Network report command failed.");
+        await Task.CompletedTask;
+    }
+
+    private async Task SendNetworkReportCoreAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            List<string> lines =
+            [
+                "🌐 Network report:",
+                $"Network available: {NetworkInterface.GetIsNetworkAvailable()}",
+                $"Public IP cache: {FormatPublicIpSnapshot(GetPublicIpSnapshot())}",
+                ""
+            ];
+
+            NetworkInterface[] adapters = NetworkInterface.GetAllNetworkInterfaces()
+                .Where(adapter =>
+                    adapter.OperationalStatus == OperationalStatus.Up &&
+                    adapter.NetworkInterfaceType is not NetworkInterfaceType.Loopback and not NetworkInterfaceType.Tunnel)
+                .OrderByDescending(adapter => adapter.Speed)
+                .Take(6)
+                .ToArray();
+
+            if (adapters.Length == 0)
+            {
+                lines.Add("No active network adapters found.");
+            }
+
+            foreach (NetworkInterface adapter in adapters)
+            {
+                try
+                {
+                    IPInterfaceProperties properties = adapter.GetIPProperties();
+                    string[] addresses = properties.UnicastAddresses
+                        .Where(address =>
+                            address.Address.AddressFamily is
+                                System.Net.Sockets.AddressFamily.InterNetwork or
+                                System.Net.Sockets.AddressFamily.InterNetworkV6)
+                        .Select(address => address.Address.ToString())
+                        .Take(4)
+                        .ToArray();
+                    string[] gateways = properties.GatewayAddresses
+                        .Select(gateway => gateway.Address.ToString())
+                        .Where(address => !string.IsNullOrWhiteSpace(address) && address != "0.0.0.0")
+                        .Take(2)
+                        .ToArray();
+                    string[] dnsServers = properties.DnsAddresses
+                        .Select(address => address.ToString())
+                        .Take(3)
+                        .ToArray();
+
+                    lines.Add($"Adapter: {adapter.Name}");
+                    lines.Add($"  Type: {adapter.NetworkInterfaceType} | Speed: {adapter.Speed / 1_000_000:N0} Mbps");
+                    lines.Add($"  IP: {(addresses.Length == 0 ? "None" : string.Join(", ", addresses))}");
+                    lines.Add($"  Gateway: {(gateways.Length == 0 ? "None" : string.Join(", ", gateways))}");
+                    lines.Add($"  DNS: {(dnsServers.Length == 0 ? "None" : string.Join(", ", dnsServers))}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to inspect network adapter {AdapterName}.", adapter.Name);
+                }
+            }
+
+            await SendTelegramMessageOnceAsync(
+                TruncateForTelegram(string.Join(Environment.NewLine, lines), 3900),
+                cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Network report command failed.");
+            await SendTelegramMessageOnceAsync($"⚠️ Network report failed: {ex.Message}", CancellationToken.None);
+        }
     }
 
     private async Task TriggerAlarmAsync(CancellationToken cancellationToken)
@@ -861,13 +1346,21 @@ public sealed class Worker : BackgroundService
             "Text-to-speech command failed.");
     }
 
-    private Task HandleScreenshotCommandAsync(CancellationToken cancellationToken)
+    private async Task HandleScreenshotCommandAsync(CancellationToken cancellationToken)
     {
+        if (TryGetCooldownRemaining("screen", GetScreenshotCooldown(), out TimeSpan remaining))
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⏳ Screenshot cooldown active. Try again in {FormatDurationForHumans(remaining)}.",
+                cancellationToken);
+            return;
+        }
+
+        MarkCooldown("screen");
+
         QueueBackgroundWork(
             CaptureAndSendScreenshotAsync,
             "Screenshot command failed.");
-
-        return Task.CompletedTask;
     }
 
     private void HandleTasksCommand()
@@ -877,7 +1370,7 @@ public sealed class Worker : BackgroundService
             "Process list command failed.");
     }
 
-    private async Task HandleKillCommandAsync(string commandText, CancellationToken cancellationToken)
+    private async Task HandleKillCommandRequestAsync(string commandText, CancellationToken cancellationToken)
     {
         string processName = GetCommandPayload(commandText);
         if (string.IsNullOrWhiteSpace(processName))
@@ -886,9 +1379,11 @@ public sealed class Worker : BackgroundService
             return;
         }
 
-        QueueBackgroundWork(
+        await RequestDangerousConfirmationAsync(
+            $"kill:{NormalizeProcessName(processName)}",
+            $"Terminate process {NormalizeProcessName(processName)}",
             token => KillProcessesByNameAsync(processName, token),
-            "Process kill command failed.");
+            cancellationToken);
     }
 
     private async Task SendStartupAppsAsync(CancellationToken cancellationToken)
@@ -922,7 +1417,7 @@ public sealed class Worker : BackgroundService
         await SendTelegramMessageOnceAsync(message.ToString().TrimEnd(), cancellationToken);
     }
 
-    private async Task HandleRestartAppCommandAsync(string commandText, CancellationToken cancellationToken)
+    private async Task HandleRestartAppCommandRequestAsync(string commandText, CancellationToken cancellationToken)
     {
         string requestedProcessName = GetCommandPayload(commandText);
         if (string.IsNullOrWhiteSpace(requestedProcessName))
@@ -931,9 +1426,11 @@ public sealed class Worker : BackgroundService
             return;
         }
 
-        QueueBackgroundWork(
+        await RequestDangerousConfirmationAsync(
+            $"restartapp:{NormalizeProcessName(requestedProcessName)}",
+            $"Restart app {NormalizeProcessName(requestedProcessName)} in the active session",
             token => RestartApplicationAsync(requestedProcessName, token),
-            "Application restart command failed.");
+            cancellationToken);
     }
 
     private async Task RestartApplicationAsync(
@@ -1230,6 +1727,375 @@ public sealed class Worker : BackgroundService
 
         launchInfo = new AppLaunchInfo(filePath, arguments);
         return true;
+    }
+
+    private void HandleServicesCommand()
+    {
+        QueueBackgroundWork(
+            SendServicesAsync,
+            "Services command failed.");
+    }
+
+    private async Task SendServicesAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            ServiceController[] services = ServiceController.GetServices();
+            try
+            {
+                string[] lines = services
+                    .OrderByDescending(service => service.ServiceName.Equals(ServiceName, StringComparison.OrdinalIgnoreCase))
+                    .ThenBy(service => service.ServiceName, StringComparer.OrdinalIgnoreCase)
+                    .Take(30)
+                    .Select(service =>
+                    {
+                        try
+                        {
+                            return $"{service.ServiceName} - {service.Status}";
+                        }
+                        catch
+                        {
+                            return $"{service.ServiceName} - Unknown";
+                        }
+                    })
+                    .ToArray();
+
+                string message = string.Join(
+                    Environment.NewLine,
+                    ["🧩 Windows services:", .. lines, "", "Use /service status [ServiceName] for details."]);
+
+                await SendTelegramMessageOnceAsync(
+                    TruncateForTelegram(message, 3900),
+                    cancellationToken);
+            }
+            finally
+            {
+                foreach (ServiceController service in services)
+                {
+                    service.Dispose();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Services command failed.");
+            await SendTelegramMessageOnceAsync($"⚠️ Services command failed: {ex.Message}", CancellationToken.None);
+        }
+    }
+
+    private async Task HandleServiceCommandAsync(string commandText, CancellationToken cancellationToken)
+    {
+        string[] parts = commandText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3)
+        {
+            await SendTelegramMessageOnceAsync(
+                "⚠️ Usage: /service status|start|stop|restart [ServiceName]",
+                cancellationToken);
+            return;
+        }
+
+        string action = parts[1].ToLowerInvariant();
+        string serviceName = string.Join(' ', parts.Skip(2)).Trim();
+
+        if (string.IsNullOrWhiteSpace(serviceName))
+        {
+            await SendTelegramMessageOnceAsync(
+                "⚠️ Usage: /service status|start|stop|restart [ServiceName]",
+                cancellationToken);
+            return;
+        }
+
+        switch (action)
+        {
+            case "status":
+                QueueBackgroundWork(
+                    token => SendServiceStatusAsync(serviceName, token),
+                    "Service status command failed.");
+                break;
+            case "start":
+            case "stop":
+            case "restart":
+                await RequestDangerousConfirmationAsync(
+                    $"service:{action}:{serviceName}",
+                    $"{action} Windows service {serviceName}",
+                    token => ControlServiceAsync(action, serviceName, token),
+                    cancellationToken);
+                break;
+            default:
+                await SendTelegramMessageOnceAsync(
+                    "⚠️ Usage: /service status|start|stop|restart [ServiceName]",
+                    cancellationToken);
+                break;
+        }
+    }
+
+    private async Task SendServiceStatusAsync(string serviceName, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using ServiceController service = new(serviceName);
+            await SendTelegramMessageOnceAsync(
+                $"🧩 Service {service.ServiceName}: {service.Status}",
+                cancellationToken);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Service {serviceName} was not found or could not be queried.",
+                cancellationToken);
+        }
+    }
+
+    private async Task ControlServiceAsync(
+        string action,
+        string serviceName,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using ServiceController service = new(serviceName);
+
+            switch (action)
+            {
+                case "start":
+                    if (service.Status == ServiceControllerStatus.Running)
+                    {
+                        await SendTelegramMessageOnceAsync(
+                            $"🧩 Service {service.ServiceName} is already running.",
+                            cancellationToken);
+                        return;
+                    }
+
+                    service.Start();
+                    service.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+                    break;
+                case "stop":
+                    if (service.Status == ServiceControllerStatus.Stopped)
+                    {
+                        await SendTelegramMessageOnceAsync(
+                            $"🧩 Service {service.ServiceName} is already stopped.",
+                            cancellationToken);
+                        return;
+                    }
+
+                    service.Stop();
+                    service.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    break;
+                case "restart":
+                    if (service.Status != ServiceControllerStatus.Stopped)
+                    {
+                        service.Stop();
+                        service.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                    }
+
+                    service.Start();
+                    service.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+                    break;
+            }
+
+            await SendTelegramMessageOnceAsync(
+                $"✅ Service {service.ServiceName} {action} completed. Current status: {service.Status}.",
+                cancellationToken);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception or System.ServiceProcess.TimeoutException)
+        {
+            _logger.LogWarning(ex, "Service control command failed for {ServiceName}.", serviceName);
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Service {serviceName} {action} failed: {ex.Message}",
+                CancellationToken.None);
+        }
+    }
+
+    private async Task HandleConfigCommandAsync(
+        string commandText,
+        long chatId,
+        CancellationToken cancellationToken)
+    {
+        string[] parts = commandText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 1)
+        {
+            await SendTelegramMessageOnceAsync(BuildSafeConfigurationReport(), cancellationToken);
+            return;
+        }
+
+        string section = parts[1].ToLowerInvariant();
+        switch (section)
+        {
+            case "admins":
+                await SendTelegramMessageOnceAsync(BuildAdminsReport(), cancellationToken);
+                break;
+            case "admin":
+                await HandleConfigAdminCommandAsync(parts, chatId, cancellationToken);
+                break;
+            case "set":
+                await HandleConfigSetCommandAsync(parts, cancellationToken);
+                break;
+            default:
+                await SendTelegramMessageOnceAsync(
+                    "⚠️ Usage: /config | /config admins | /config admin add|remove [ChatId] | /config set [Key] [Value]",
+                    cancellationToken);
+                break;
+        }
+    }
+
+    private async Task HandleConfigAdminCommandAsync(
+        string[] parts,
+        long requesterChatId,
+        CancellationToken cancellationToken)
+    {
+        if (parts.Length < 4 ||
+            !long.TryParse(parts[3], out long targetChatId) ||
+            targetChatId == 0)
+        {
+            await SendTelegramMessageOnceAsync(
+                "⚠️ Usage: /config admin add|remove [ChatId]",
+                cancellationToken);
+            return;
+        }
+
+        string action = parts[2].ToLowerInvariant();
+        switch (action)
+        {
+            case "add":
+                try
+                {
+                    using CancellationTokenSource timeout =
+                        CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+                    await _botClient.GetChat(targetChatId, timeout.Token);
+                }
+                catch (Exception ex) when (ex is ApiRequestException or HttpRequestException or TaskCanceledException)
+                {
+                    await SendTelegramMessageOnceAsync(
+                        $"⚠️ Admin chat {targetChatId} could not be validated: {ex.Message}",
+                        cancellationToken);
+                    return;
+                }
+
+                UpdateAdminChatIds(current =>
+                    current.Contains(targetChatId) ? current : [.. current, targetChatId]);
+                if (!await SaveConfigurationOrReplyAsync(cancellationToken))
+                {
+                    return;
+                }
+
+                await SendTelegramMessageOnceAsync($"✅ Admin chat {targetChatId} added.", cancellationToken);
+                break;
+            case "remove":
+                if (targetChatId == requesterChatId)
+                {
+                    await SendTelegramMessageOnceAsync(
+                        "⚠️ Refusing to remove the admin that is issuing this command.",
+                        cancellationToken);
+                    return;
+                }
+
+                long[] currentAdmins = GetAdminChatIdsSnapshot();
+                if (!currentAdmins.Contains(targetChatId))
+                {
+                    await SendTelegramMessageOnceAsync($"⚠️ Admin chat {targetChatId} is not configured.", cancellationToken);
+                    return;
+                }
+
+                if (currentAdmins.Length <= 1)
+                {
+                    await SendTelegramMessageOnceAsync("⚠️ Refusing to remove the last configured admin.", cancellationToken);
+                    return;
+                }
+
+                UpdateAdminChatIds(current => current.Where(id => id != targetChatId).ToArray());
+                if (!await SaveConfigurationOrReplyAsync(cancellationToken))
+                {
+                    return;
+                }
+
+                await SendTelegramMessageOnceAsync($"✅ Admin chat {targetChatId} removed.", cancellationToken);
+                break;
+            default:
+                await SendTelegramMessageOnceAsync(
+                    "⚠️ Usage: /config admin add|remove [ChatId]",
+                    cancellationToken);
+                break;
+        }
+    }
+
+    private async Task HandleConfigSetCommandAsync(
+        string[] parts,
+        CancellationToken cancellationToken)
+    {
+        if (parts.Length < 4)
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /config set [Key] [Value]", cancellationToken);
+            return;
+        }
+
+        string key = parts[2];
+        string value = string.Join(' ', parts.Skip(3));
+
+        if (!TrySetConfigurationValue(key, value, out string? result))
+        {
+            await SendTelegramMessageOnceAsync($"⚠️ {result}", cancellationToken);
+            return;
+        }
+
+        if (!await SaveConfigurationOrReplyAsync(cancellationToken))
+        {
+            return;
+        }
+
+        await SendTelegramMessageOnceAsync($"✅ {result}", cancellationToken);
+    }
+
+    private string BuildSafeConfigurationReport()
+    {
+        AppConfiguration configuration = GetConfigurationSnapshot();
+        return string.Join(
+            Environment.NewLine,
+            "⚙️ WinSystemHelper configuration:",
+            $"Admins: {GetAdminChatIdsSnapshot().Length}",
+            $"AlertsEnabled: {configuration.AlertsEnabled}",
+            $"BatteryLowPercent: {configuration.BatteryLowPercent}",
+            $"DiskLowPercent: {configuration.DiskLowPercent}",
+            $"HealthCheckIntervalMinutes: {configuration.HealthCheckIntervalMinutes}",
+            $"PublicIpCacheMinutes: {configuration.PublicIpCacheMinutes}",
+            $"PublicIpFailureBackoffMinutes: {configuration.PublicIpFailureBackoffMinutes}",
+            $"DangerousCommandConfirmationSeconds: {configuration.DangerousCommandConfirmationSeconds}",
+            $"DangerousCommandCooldownSeconds: {configuration.DangerousCommandCooldownSeconds}",
+            $"ScreenshotCooldownSeconds: {configuration.ScreenshotCooldownSeconds}",
+            $"MicCooldownSeconds: {configuration.MicCooldownSeconds}",
+            $"AllowCrossAdminConfirmations: {configuration.AllowCrossAdminConfirmations}",
+            "BotToken: configured (hidden)");
+    }
+
+    private string BuildAdminsReport()
+    {
+        string[] admins = GetAdminChatIdsSnapshot()
+            .Select((admin, index) => $"{index + 1}. {admin}")
+            .ToArray();
+
+        return string.Join(
+            Environment.NewLine,
+            ["👥 Configured admins:", .. admins]);
+    }
+
+    private async Task HandleUpdateCommandRequestAsync(
+        Message message,
+        string commandText,
+        long replyChatId,
+        CancellationToken cancellationToken)
+    {
+        if (message.Document is null && string.IsNullOrWhiteSpace(GetCommandPayload(commandText)))
+        {
+            await SendTelegramMessageOnceAsync(
+                "⚠️ Usage: send /update https://example.com/update.zip or attach a .zip file with caption /update.",
+                cancellationToken);
+            return;
+        }
+
+        await RequestDangerousConfirmationAsync(
+            "update",
+            "Apply an OTA update and restart the service",
+            token => HandleUpdateCommandAsync(message, commandText, replyChatId, token),
+            cancellationToken);
     }
 
     private async Task HandleUpdateCommandAsync(
@@ -1561,7 +2427,7 @@ public sealed class Worker : BackgroundService
 
             await SendTelegramMessageOnceAsync($"🗣️ User answered: {answer}", cancellationToken);
         }
-        catch (TimeoutException)
+        catch (System.TimeoutException)
         {
             await SendTelegramBroadcastOnceAsync("⏳ User ignored the prompt (Timeout).", CancellationToken.None);
         }
@@ -1601,7 +2467,7 @@ public sealed class Worker : BackgroundService
             string response = await File.ReadAllTextAsync(tempFile, Encoding.UTF8, cancellationToken);
             await SendTelegramMessageOnceAsync($"📝 User replied: {response}", cancellationToken);
         }
-        catch (TimeoutException)
+        catch (System.TimeoutException)
         {
             await SendTelegramBroadcastOnceAsync("⏳ User ignored the prompt (Timeout).", CancellationToken.None);
         }
@@ -1675,7 +2541,7 @@ public sealed class Worker : BackgroundService
                 caption: $"🖼️ Screenshot captured at {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}.",
                 cancellationToken: timeout.Token);
         }
-        catch (TimeoutException)
+        catch (System.TimeoutException)
         {
             await SendTelegramMessageOnceAsync("⏳ Screenshot capture timed out.", CancellationToken.None);
         }
@@ -1803,6 +2669,16 @@ public sealed class Worker : BackgroundService
             return;
         }
 
+        if (TryGetCooldownRemaining("mic", GetMicCooldown(), out TimeSpan remaining))
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⏳ Mic command cooldown active. Try again in {FormatDurationForHumans(remaining)}.",
+                cancellationToken);
+            return;
+        }
+
+        MarkCooldown("mic");
+
         if (micCommand.Loop)
         {
             await StartMicAlarmLoopAsync(micCommand.DurationSeconds, cancellationToken);
@@ -1842,6 +2718,8 @@ public sealed class Worker : BackgroundService
             {
                 loopCts = CancellationTokenSource.CreateLinkedTokenSource(_serviceStopping.Token);
                 _micLoopCts = loopCts;
+                _micLoopStartedAt = DateTimeOffset.Now;
+                _micLoopLongAlertSent = false;
             }
         }
 
@@ -1870,6 +2748,7 @@ public sealed class Worker : BackgroundService
                 if (ReferenceEquals(_micLoopCts, loopCts))
                 {
                     _micLoopCts = null;
+                    _micLoopStartedAt = null;
                 }
             }
 
@@ -1939,6 +2818,7 @@ public sealed class Worker : BackgroundService
                 if (ReferenceEquals(_micLoopCts, loopCts))
                 {
                     _micLoopCts = null;
+                    _micLoopStartedAt = null;
                 }
             }
 
@@ -2551,6 +3431,362 @@ public sealed class Worker : BackgroundService
             : normalized;
     }
 
+    private static long[] NormalizeAdminChatIds(IEnumerable<long> adminChatIds)
+    {
+        return adminChatIds
+            .Where(chatId => chatId != 0)
+            .Distinct()
+            .ToArray();
+    }
+
+    private long[] GetAdminChatIdsSnapshot()
+    {
+        return Volatile.Read(ref _adminChatIds);
+    }
+
+    private bool IsAdminChatId(long chatId)
+    {
+        return GetAdminChatIdsSnapshot().Contains(chatId);
+    }
+
+    private void UpdateAdminChatIds(Func<long[], long[]> update)
+    {
+        lock (_configurationSync)
+        {
+            long[] updated = NormalizeAdminChatIds(update(GetAdminChatIdsSnapshot()));
+            _configuration.AdminChatIds = updated;
+            _configuration.AdminChatId = 0;
+            Volatile.Write(ref _adminChatIds, updated);
+        }
+    }
+
+    private AppConfiguration GetConfigurationSnapshot()
+    {
+        lock (_configurationSync)
+        {
+            return new AppConfiguration
+            {
+                BotToken = _configuration.BotToken,
+                AdminChatIds = GetAdminChatIdsSnapshot(),
+                AdminChatId = _configuration.AdminChatId,
+                AlertsEnabled = _configuration.AlertsEnabled,
+                BatteryLowPercent = _configuration.BatteryLowPercent,
+                DiskLowPercent = _configuration.DiskLowPercent,
+                HealthCheckIntervalMinutes = _configuration.HealthCheckIntervalMinutes,
+                PublicIpCacheMinutes = _configuration.PublicIpCacheMinutes,
+                PublicIpFailureBackoffMinutes = _configuration.PublicIpFailureBackoffMinutes,
+                DangerousCommandConfirmationSeconds = _configuration.DangerousCommandConfirmationSeconds,
+                DangerousCommandCooldownSeconds = _configuration.DangerousCommandCooldownSeconds,
+                ScreenshotCooldownSeconds = _configuration.ScreenshotCooldownSeconds,
+                MicCooldownSeconds = _configuration.MicCooldownSeconds,
+                AllowCrossAdminConfirmations = _configuration.AllowCrossAdminConfirmations
+            };
+        }
+    }
+
+    private void SaveConfiguration()
+    {
+        lock (_configurationSync)
+        {
+            string configPath = GetConfigurationPath();
+            string tempPath = $"{configPath}.{Guid.NewGuid():N}.tmp";
+            string json = JsonSerializer.Serialize(_configuration, ConfigurationJsonOptions);
+
+            File.WriteAllText(tempPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            File.Move(tempPath, configPath, overwrite: true);
+        }
+    }
+
+    private async Task<bool> SaveConfigurationOrReplyAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            SaveConfiguration();
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            _logger.LogWarning(ex, "Failed to save runtime configuration.");
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Failed to save config.json: {ex.Message}",
+                cancellationToken);
+            return false;
+        }
+    }
+
+    private static string GetConfigurationPath()
+    {
+        return Path.Combine(AppContext.BaseDirectory, ConfigFileName);
+    }
+
+    private bool TrySetConfigurationValue(string key, string value, out string? result)
+    {
+        result = null;
+
+        lock (_configurationSync)
+        {
+            switch (key.ToLowerInvariant())
+            {
+                case "alertsenabled":
+                    if (!TryParseBoolean(value, out bool alertsEnabled))
+                    {
+                        result = "AlertsEnabled must be true or false.";
+                        return false;
+                    }
+
+                    _configuration.AlertsEnabled = alertsEnabled;
+                    result = $"AlertsEnabled set to {alertsEnabled}.";
+                    return true;
+                case "allowcrossadminconfirmations":
+                    if (!TryParseBoolean(value, out bool allowCrossAdminConfirmations))
+                    {
+                        result = "AllowCrossAdminConfirmations must be true or false.";
+                        return false;
+                    }
+
+                    _configuration.AllowCrossAdminConfirmations = allowCrossAdminConfirmations;
+                    result = $"AllowCrossAdminConfirmations set to {allowCrossAdminConfirmations}.";
+                    return true;
+                case "batterylowpercent":
+                    return TrySetIntConfigurationValue(
+                        value,
+                        1,
+                        100,
+                        number => _configuration.BatteryLowPercent = number,
+                        "BatteryLowPercent",
+                        out result);
+                case "disklowpercent":
+                    return TrySetIntConfigurationValue(
+                        value,
+                        1,
+                        100,
+                        number => _configuration.DiskLowPercent = number,
+                        "DiskLowPercent",
+                        out result);
+                case "healthcheckintervalminutes":
+                    return TrySetIntConfigurationValue(
+                        value,
+                        1,
+                        1440,
+                        number => _configuration.HealthCheckIntervalMinutes = number,
+                        "HealthCheckIntervalMinutes",
+                        out result);
+                case "publicipcacheminutes":
+                    return TrySetIntConfigurationValue(
+                        value,
+                        1,
+                        1440,
+                        number => _configuration.PublicIpCacheMinutes = number,
+                        "PublicIpCacheMinutes",
+                        out result);
+                case "publicipfailurebackoffminutes":
+                    return TrySetIntConfigurationValue(
+                        value,
+                        1,
+                        1440,
+                        number => _configuration.PublicIpFailureBackoffMinutes = number,
+                        "PublicIpFailureBackoffMinutes",
+                        out result);
+                case "dangerouscommandconfirmationseconds":
+                    return TrySetIntConfigurationValue(
+                        value,
+                        10,
+                        300,
+                        number => _configuration.DangerousCommandConfirmationSeconds = number,
+                        "DangerousCommandConfirmationSeconds",
+                        out result);
+                case "dangerouscommandcooldownseconds":
+                    return TrySetIntConfigurationValue(
+                        value,
+                        0,
+                        3600,
+                        number => _configuration.DangerousCommandCooldownSeconds = number,
+                        "DangerousCommandCooldownSeconds",
+                        out result);
+                case "screenshotcooldownseconds":
+                    return TrySetIntConfigurationValue(
+                        value,
+                        0,
+                        3600,
+                        number => _configuration.ScreenshotCooldownSeconds = number,
+                        "ScreenshotCooldownSeconds",
+                        out result);
+                case "miccooldownseconds":
+                    return TrySetIntConfigurationValue(
+                        value,
+                        0,
+                        3600,
+                        number => _configuration.MicCooldownSeconds = number,
+                        "MicCooldownSeconds",
+                        out result);
+                default:
+                    result = $"Unknown configuration key: {key}.";
+                    return false;
+            }
+        }
+    }
+
+    private static bool TrySetIntConfigurationValue(
+        string value,
+        int min,
+        int max,
+        Action<int> assign,
+        string name,
+        out string? result)
+    {
+        if (!int.TryParse(value, out int number) || number < min || number > max)
+        {
+            result = $"{name} must be a number between {min} and {max}.";
+            return false;
+        }
+
+        assign(number);
+        result = $"{name} set to {number}.";
+        return true;
+    }
+
+    private static bool TryParseBoolean(string value, out bool result)
+    {
+        if (bool.TryParse(value, out result))
+        {
+            return true;
+        }
+
+        if (value.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("y", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("on", StringComparison.OrdinalIgnoreCase))
+        {
+            result = true;
+            return true;
+        }
+
+        if (value.Equals("0", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("no", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("n", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("off", StringComparison.OrdinalIgnoreCase))
+        {
+            result = false;
+            return true;
+        }
+
+        result = false;
+        return false;
+    }
+
+    private TimeSpan GetDangerousCommandConfirmationTimeout()
+    {
+        return TimeSpan.FromSeconds(Math.Clamp(_configuration.DangerousCommandConfirmationSeconds, 10, 300));
+    }
+
+    private TimeSpan GetDangerousCommandCooldown()
+    {
+        return TimeSpan.FromSeconds(Math.Clamp(_configuration.DangerousCommandCooldownSeconds, 0, 3600));
+    }
+
+    private TimeSpan GetScreenshotCooldown()
+    {
+        return TimeSpan.FromSeconds(Math.Clamp(_configuration.ScreenshotCooldownSeconds, 0, 3600));
+    }
+
+    private TimeSpan GetMicCooldown()
+    {
+        return TimeSpan.FromSeconds(Math.Clamp(_configuration.MicCooldownSeconds, 0, 3600));
+    }
+
+    private TimeSpan GetSmartAlertInterval()
+    {
+        return TimeSpan.FromMinutes(Math.Clamp(_configuration.HealthCheckIntervalMinutes, 1, 1440));
+    }
+
+    private TimeSpan GetPublicIpCacheDuration()
+    {
+        return TimeSpan.FromMinutes(Math.Clamp(_configuration.PublicIpCacheMinutes, 1, 1440));
+    }
+
+    private TimeSpan GetPublicIpFailureBackoff()
+    {
+        return TimeSpan.FromMinutes(Math.Clamp(_configuration.PublicIpFailureBackoffMinutes, 1, 1440));
+    }
+
+    private bool GetAllowCrossAdminConfirmations()
+    {
+        return _configuration.AllowCrossAdminConfirmations;
+    }
+
+    private bool TryGetCooldownRemaining(
+        string key,
+        TimeSpan cooldown,
+        out TimeSpan remaining)
+    {
+        remaining = TimeSpan.Zero;
+        if (cooldown <= TimeSpan.Zero)
+        {
+            return false;
+        }
+
+        if (!_cooldowns.TryGetValue(key, out DateTimeOffset lastRunAt))
+        {
+            return false;
+        }
+
+        TimeSpan elapsed = DateTimeOffset.Now - lastRunAt;
+        if (elapsed >= cooldown)
+        {
+            _cooldowns.TryRemove(key, out _);
+            return false;
+        }
+
+        remaining = cooldown - elapsed;
+        return true;
+    }
+
+    private void MarkCooldown(string key)
+    {
+        _cooldowns[key] = DateTimeOffset.Now;
+    }
+
+    private static string FormatDurationForHumans(TimeSpan duration)
+    {
+        if (duration.TotalMinutes >= 1)
+        {
+            return $"{Math.Ceiling(duration.TotalMinutes):N0} minute(s)";
+        }
+
+        return $"{Math.Ceiling(duration.TotalSeconds):N0} second(s)";
+    }
+
+    private int CreateConfirmationId()
+    {
+        int confirmationId;
+        do
+        {
+            confirmationId = RandomNumberGenerator.GetInt32(100000, 999999);
+        }
+        while (_pendingConfirmations.ContainsKey(confirmationId));
+
+        return confirmationId;
+    }
+
+    private static bool TryParseConfirmationId(string commandText, out int confirmationId)
+    {
+        return int.TryParse(GetCommandPayload(commandText), out confirmationId);
+    }
+
+    private int RemoveExpiredConfirmations()
+    {
+        DateTimeOffset now = DateTimeOffset.Now;
+        foreach (KeyValuePair<int, PendingConfirmation> pending in _pendingConfirmations)
+        {
+            if (pending.Value.ExpiresAt <= now)
+            {
+                _pendingConfirmations.TryRemove(pending.Key, out _);
+            }
+        }
+
+        return _pendingConfirmations.Count;
+    }
+
     private void DeleteTempFile(string? tempFile)
     {
         if (string.IsNullOrWhiteSpace(tempFile) || !File.Exists(tempFile))
@@ -2631,6 +3867,8 @@ public sealed class Worker : BackgroundService
         {
             CancellationTokenSource? loopCts = _micLoopCts;
             _micLoopCts = null;
+            _micLoopStartedAt = null;
+            _micLoopLongAlertSent = false;
             loopCts?.Cancel();
             return loopCts;
         }
@@ -2722,13 +3960,249 @@ public sealed class Worker : BackgroundService
         }
     }
 
+    private async Task RunSmartAlertLoopAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await RunSmartAlertsOnceAsync(cancellationToken);
+
+                lock (_telemetrySync)
+                {
+                    _lastSmartAlertAt = DateTimeOffset.Now;
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                RecordError($"Smart alerts: {ex.GetType().Name}: {ex.Message}");
+                _logger.LogWarning(ex, "Smart alert loop iteration failed.");
+            }
+
+            try
+            {
+                await Task.Delay(GetSmartAlertInterval(), cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                break;
+            }
+        }
+    }
+
+    private async Task RunSmartAlertsOnceAsync(CancellationToken cancellationToken)
+    {
+        if (!_configuration.AlertsEnabled)
+        {
+            return;
+        }
+
+        await CheckBatteryAlertAsync(cancellationToken);
+        await CheckDiskAlertAsync(cancellationToken);
+        await CheckPublicIpChangeAlertAsync(cancellationToken);
+        await CheckMicLoopAlertAsync(cancellationToken);
+        await CheckRepeatedTelegramFailureAlertAsync(cancellationToken);
+    }
+
+    private async Task CheckBatteryAlertAsync(CancellationToken cancellationToken)
+    {
+        if (!TryGetBatteryMetric(out int percent, out string status))
+        {
+            return;
+        }
+
+        int threshold = Math.Clamp(_configuration.BatteryLowPercent, 1, 100);
+        bool low = percent <= threshold && status.Equals("Discharging", StringComparison.OrdinalIgnoreCase);
+        bool shouldSend;
+
+        lock (_alertStateSync)
+        {
+            shouldSend = low && !_batteryLowAlertActive;
+            if (low)
+            {
+                _batteryLowAlertActive = true;
+            }
+            else if (percent >= Math.Min(100, threshold + 5) || !status.Equals("Discharging", StringComparison.OrdinalIgnoreCase))
+            {
+                _batteryLowAlertActive = false;
+            }
+        }
+
+        if (shouldSend)
+        {
+            await SendTelegramBroadcastOnceAsync(
+                $"🔋 Battery low: {percent}% | Status: {status}",
+                cancellationToken);
+        }
+    }
+
+    private async Task CheckDiskAlertAsync(CancellationToken cancellationToken)
+    {
+        int threshold = Math.Clamp(_configuration.DiskLowPercent, 1, 100);
+        DriveInfo? lowestDrive = null;
+        double lowestFreePercent = 100;
+
+        foreach (DriveInfo drive in DriveInfo.GetDrives())
+        {
+            try
+            {
+                if (!drive.IsReady || drive.DriveType != DriveType.Fixed || drive.TotalSize <= 0)
+                {
+                    continue;
+                }
+
+                double freePercent = drive.AvailableFreeSpace * 100d / drive.TotalSize;
+                if (freePercent < lowestFreePercent)
+                {
+                    lowestFreePercent = freePercent;
+                    lowestDrive = drive;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _logger.LogDebug(ex, "Failed to inspect disk {DriveName}.", drive.Name);
+            }
+        }
+
+        if (lowestDrive is null)
+        {
+            return;
+        }
+
+        bool low = lowestFreePercent <= threshold;
+        bool shouldSend;
+
+        lock (_alertStateSync)
+        {
+            shouldSend = low && !_diskLowAlertActive;
+            if (low)
+            {
+                _diskLowAlertActive = true;
+            }
+            else if (lowestFreePercent >= Math.Min(100, threshold + 5))
+            {
+                _diskLowAlertActive = false;
+            }
+        }
+
+        if (shouldSend)
+        {
+            await SendTelegramBroadcastOnceAsync(
+                $"💽 Disk space low: {lowestDrive.Name} has {lowestFreePercent:N1}% free.",
+                cancellationToken);
+        }
+    }
+
+    private async Task CheckPublicIpChangeAlertAsync(CancellationToken cancellationToken)
+    {
+        PublicIpLookupResult result = await GetPublicIpAsync(forceRefresh: false, cancellationToken);
+        if (!result.Success || string.IsNullOrWhiteSpace(result.PublicIp))
+        {
+            return;
+        }
+
+        string? previousIp;
+        bool changed;
+
+        lock (_alertStateSync)
+        {
+            previousIp = _lastPublicIpAlerted;
+            changed = !string.IsNullOrWhiteSpace(previousIp) &&
+                !previousIp.Equals(result.PublicIp, StringComparison.OrdinalIgnoreCase);
+            _lastPublicIpAlerted = result.PublicIp;
+        }
+
+        if (changed)
+        {
+            await SendTelegramBroadcastOnceAsync(
+                $"🌐 Public IP changed: {previousIp} -> {result.PublicIp}",
+                cancellationToken);
+        }
+    }
+
+    private async Task CheckMicLoopAlertAsync(CancellationToken cancellationToken)
+    {
+        DateTimeOffset? startedAt;
+        bool alreadySent;
+
+        lock (_micLoopSync)
+        {
+            startedAt = _micLoopStartedAt;
+            alreadySent = _micLoopLongAlertSent;
+            if (startedAt.HasValue &&
+                !alreadySent &&
+                DateTimeOffset.Now - startedAt.Value >= TimeSpan.FromMinutes(30))
+            {
+                _micLoopLongAlertSent = true;
+            }
+            else
+            {
+                return;
+            }
+        }
+
+        await SendTelegramBroadcastOnceAsync(
+            $"🎤 Persistent Active Alarm has been running since {startedAt.Value:yyyy-MM-dd HH:mm:ss zzz}.",
+            cancellationToken);
+    }
+
+    private async Task CheckRepeatedTelegramFailureAlertAsync(CancellationToken cancellationToken)
+    {
+        TelemetrySnapshot telemetry = GetTelemetrySnapshot();
+        if (telemetry.PollingFailureStreak < 5)
+        {
+            return;
+        }
+
+        bool shouldSend;
+        lock (_alertStateSync)
+        {
+            shouldSend = !_repeatedTelegramFailureAlertActive;
+            _repeatedTelegramFailureAlertActive = true;
+        }
+
+        if (shouldSend)
+        {
+            await SendTelegramBroadcastOnceAsync(
+                $"⚠️ Telegram polling has failed {telemetry.PollingFailureStreak} time(s). Last error: {telemetry.LastError}",
+                cancellationToken);
+        }
+    }
+
+    private bool TryGetBatteryMetric(out int percent, out string status)
+    {
+        percent = 0;
+        status = "Unknown";
+
+        if (!GetSystemPowerStatus(out SystemPowerStatus powerStatus) ||
+            powerStatus.BatteryLifePercent == BatteryLifePercentUnknown ||
+            (powerStatus.BatteryFlag & BatteryFlagNoSystemBattery) == BatteryFlagNoSystemBattery)
+        {
+            return false;
+        }
+
+        percent = powerStatus.BatteryLifePercent;
+        status = powerStatus.ACLineStatus switch
+        {
+            0 => "Discharging",
+            1 => "Charging",
+            _ => "Unknown"
+        };
+
+        return true;
+    }
+
     private async Task RegisterTelegramMenuAsync(CancellationToken cancellationToken)
     {
         try
         {
             BotCommand[] commands = BuildTelegramCommands();
 
-            foreach (long adminChatId in _adminChatIds)
+            foreach (long adminChatId in GetAdminChatIdsSnapshot())
             {
                 try
                 {
@@ -2770,12 +4244,16 @@ public sealed class Worker : BackgroundService
         return
         [
             new BotCommand { Command = "status", Description = "Show service status" },
+            new BotCommand { Command = "healthcheck", Description = "Show fast healthcheck" },
             new BotCommand { Command = "version", Description = "Show installed version" },
+            new BotCommand { Command = "confirm", Description = "Confirm pending command" },
+            new BotCommand { Command = "cancel", Description = "Cancel pending command" },
             new BotCommand { Command = "lock", Description = "Lock the workstation" },
-            new BotCommand { Command = "shutdown", Description = "Shut down in 10 seconds" },
-            new BotCommand { Command = "restart", Description = "Restart the PC" },
-            new BotCommand { Command = "sleep", Description = "Put the PC to sleep" },
+            new BotCommand { Command = "shutdown", Description = "Request shutdown" },
+            new BotCommand { Command = "restart", Description = "Request restart" },
+            new BotCommand { Command = "sleep", Description = "Request sleep" },
             new BotCommand { Command = "ip", Description = "Show public IP address" },
+            new BotCommand { Command = "net", Description = "Show local network report" },
             new BotCommand { Command = "alarm", Description = "Play system alert sound" },
             new BotCommand { Command = "mic", Description = "Trigger overt alarm audio recording" },
             new BotCommand { Command = "msg", Description = "Show a screen message" },
@@ -2787,6 +4265,9 @@ public sealed class Worker : BackgroundService
             new BotCommand { Command = "kill", Description = "Terminate a process" },
             new BotCommand { Command = "startup", Description = "List startup applications" },
             new BotCommand { Command = "restartapp", Description = "Restart an application" },
+            new BotCommand { Command = "services", Description = "List Windows services" },
+            new BotCommand { Command = "service", Description = "Manage a Windows service" },
+            new BotCommand { Command = "config", Description = "Manage runtime configuration" },
             new BotCommand { Command = "update", Description = "Apply an OTA update" },
             new BotCommand { Command = "help", Description = "Show available commands" },
             new BotCommand { Command = "stop", Description = "Stop the service" },
@@ -2933,7 +4414,7 @@ public sealed class Worker : BackgroundService
             if (waitResult == WaitTimeout)
             {
                 TerminateProcessIfNeeded(processInformation.hProcess);
-                throw new TimeoutException("Active user process timed out.");
+                throw new System.TimeoutException("Active user process timed out.");
             }
 
             if (waitResult != WaitObject0)
@@ -3033,6 +4514,8 @@ public sealed class Worker : BackgroundService
         Exception exception,
         CancellationToken cancellationToken)
     {
+        RecordPollingFailure(exception);
+
         TimeSpan retryDelay = CalculateBackoff(
             attempt,
             InitialTelegramPollingFailureDelay,
@@ -3130,7 +4613,7 @@ public sealed class Worker : BackgroundService
     {
         var anyDelivered = false;
 
-        foreach (long adminChatId in _adminChatIds)
+        foreach (long adminChatId in GetAdminChatIdsSnapshot())
         {
             try
             {
@@ -3162,7 +4645,7 @@ public sealed class Worker : BackgroundService
 
     private long GetReplyChatId()
     {
-        return _replyChatId.Value ?? _adminChatIds.First();
+        return _replyChatId.Value ?? GetAdminChatIdsSnapshot().First();
     }
 
     private static CancellationTokenSource CreateTimeoutTokenSource(
@@ -3197,6 +4680,52 @@ public sealed class Worker : BackgroundService
     private readonly record struct StartupEntry(string Name, string Command, string Source);
 
     private readonly record struct AppLaunchInfo(string FilePath, string Arguments);
+
+    private readonly record struct TelemetrySnapshot(
+        DateTimeOffset? LastPollingSuccessAt,
+        DateTimeOffset? LastPollingFailureAt,
+        DateTimeOffset? LastWakeAlertAt,
+        DateTimeOffset? LastStartupAlertAt,
+        DateTimeOffset? LastSmartAlertAt,
+        string? LastError,
+        int PollingFailureStreak);
+
+    private readonly record struct PublicIpSnapshot(
+        string? PublicIp,
+        DateTimeOffset? FetchedAt,
+        DateTimeOffset? NextAttemptAt,
+        int FailureCount);
+
+    private readonly record struct PublicIpLookupResult(
+        bool Success,
+        string? PublicIp,
+        bool FromCache,
+        string? ErrorMessage,
+        string? StalePublicIp)
+    {
+        public static PublicIpLookupResult Cached(string publicIp, DateTimeOffset fetchedAt)
+        {
+            return new PublicIpLookupResult(true, publicIp, FromCache: true, ErrorMessage: null, StalePublicIp: null);
+        }
+
+        public static PublicIpLookupResult Fresh(string publicIp)
+        {
+            return new PublicIpLookupResult(true, publicIp, FromCache: false, ErrorMessage: null, StalePublicIp: null);
+        }
+
+        public static PublicIpLookupResult Failed(string errorMessage, string? stalePublicIp)
+        {
+            return new PublicIpLookupResult(false, null, FromCache: false, errorMessage, stalePublicIp);
+        }
+    }
+
+    private readonly record struct PendingConfirmation(
+        int Id,
+        string CommandKey,
+        string Description,
+        long RequesterChatId,
+        DateTimeOffset ExpiresAt,
+        Func<CancellationToken, Task> Operation);
 
     private readonly record struct UpdaterScriptOptions(
         string ServiceName,
