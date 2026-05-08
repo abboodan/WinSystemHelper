@@ -27,8 +27,6 @@ public sealed class AppConfiguration
 
     public int DangerousCommandCooldownSeconds { get; set; } = 60;
 
-    public int ScreenshotCooldownSeconds { get; set; } = 30;
-
     public int MicCooldownSeconds { get; set; } = 30;
 
     public bool AllowCrossAdminConfirmations { get; set; }

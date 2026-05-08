@@ -116,6 +116,7 @@ public sealed class Worker : BackgroundService
     private readonly AsyncLocal<long?> _replyChatId = new();
     private readonly SemaphoreSlim _resumeNotificationLock = new(1, 1);
     private readonly SemaphoreSlim _micRecordingLock = new(1, 1);
+    private readonly SemaphoreSlim _screenshotLock = new(1, 1);
     private readonly SemaphoreSlim _updateLock = new(1, 1);
     private readonly ConcurrentDictionary<string, DateTimeOffset> _cooldowns = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<int, PendingConfirmation> _pendingConfirmations = new();
@@ -887,21 +888,34 @@ public sealed class Worker : BackgroundService
     {
         string helpText = string.Join(
             Environment.NewLine,
-            "📜 Available Commands:",
+            "📜 WinSystemHelper Commands",
             "",
+            "📊 Status & Monitoring",
             "/status - Show service, machine, network, and timestamp details.",
             "/healthcheck - Show fast service health and cached state.",
             "/version - Show the installed WinSystemHelper version.",
+            "/ip - Show the cached or refreshed public IP address.",
+            "/ip refresh - Force a public IP refresh with timeout/backoff.",
+            "/net - Show local network adapters, IPs, gateways, and DNS.",
+            "/tasks - 📋 Show the top 10 memory-consuming processes.",
+            "/startup - 🚀 List configured startup applications.",
+            "/services - 🧩 List Windows services.",
+            "",
+            "✅ Confirmation",
             "/confirm [Id] - Confirm a pending dangerous command.",
             "/cancel [Id] - Cancel a pending dangerous command.",
+            "",
+            "🖥️ System Control",
             "/lock - Lock the Windows workstation.",
             "/shutdown - Request shutdown confirmation.",
             "/restart - 🔄 Request restart confirmation.",
             "/sleep - 🌙 Request sleep confirmation.",
-            "/ip - Show the cached or refreshed public IP address.",
-            "/ip refresh - Force a public IP refresh with timeout/backoff.",
-            "/net - Show local network adapters, IPs, gateways, and DNS.",
             "/alarm - Play a system alert sound.",
+            "/kill [ProcessName] - 🔪 Terminate matching processes.",
+            "/restartapp [ProcessName] - 🔄 Restart an app in the active session.",
+            "/service status|start|stop|restart [ServiceName] - 🧩 Manage a Windows service.",
+            "",
+            "🎙️ Interactive & Session 0 Tools",
             "/mic [seconds] - Trigger an overt alarm and record audio for up to 60 seconds.",
             "/mic [seconds] loop - Start a persistent overt active alarm loop.",
             "/mic stop - Stop the persistent active alarm loop.",
@@ -910,20 +924,20 @@ public sealed class Worker : BackgroundService
             "/prompt [text] - Force a text response from the active user.",
             "/speak [text] - 🗣️ Speak a message through the active session.",
             "/screen - 🖼️ Capture and return the primary screen.",
-            "/tasks - 📋 Show the top 10 memory-consuming processes.",
-            "/kill [ProcessName] - 🔪 Terminate matching processes.",
-            "/startup - 🚀 List configured startup applications.",
-            "/restartapp [ProcessName] - 🔄 Restart an app in the active session.",
-            "/services - 🧩 List Windows services.",
-            "/service status|start|stop|restart [ServiceName] - 🧩 Manage a Windows service.",
+            "",
+            "⚙️ Configuration",
             "/config - ⚙️ Show safe runtime configuration.",
+            "/config export - ⚙️ Show a safe config.json preview.",
+            "/config alerts on|off - ⚙️ Enable or disable smart alerts.",
             "/config set [Key] [Value] - ⚙️ Update runtime configuration.",
             "/config admins - 👥 List configured admins.",
             "/config admin add|remove [ChatId] - 👥 Manage admins without reinstall.",
+            "",
+            "🔄 Service & Updates",
             "/update [https-url] - 🔄 Apply an OTA update from a ZIP file or attached document.",
-            "/help - Show this command list.",
             "/stop - Request WinSystemHelper service stop.",
-            "/uninstall - Request service uninstall.");
+            "/uninstall - Request service uninstall.",
+            "/help - Show this command list.");
 
         await SendTelegramMessageOnceAsync(helpText, cancellationToken);
     }
@@ -1348,19 +1362,33 @@ public sealed class Worker : BackgroundService
 
     private async Task HandleScreenshotCommandAsync(CancellationToken cancellationToken)
     {
-        if (TryGetCooldownRemaining("screen", GetScreenshotCooldown(), out TimeSpan remaining))
+        if (!await _screenshotLock.WaitAsync(0, cancellationToken))
         {
             await SendTelegramMessageOnceAsync(
-                $"⏳ Screenshot cooldown active. Try again in {FormatDurationForHumans(remaining)}.",
+                "⏳ Screenshot capture is still in progress. Ignoring this request.",
                 cancellationToken);
             return;
         }
 
-        MarkCooldown("screen");
+        await SendTelegramMessageOnceAsync(
+            "🖼️ Screenshot capture started. I will send the image when it is ready.",
+            cancellationToken);
 
         QueueBackgroundWork(
-            CaptureAndSendScreenshotAsync,
+            CaptureAndSendScreenshotWithLockAsync,
             "Screenshot command failed.");
+    }
+
+    private async Task CaptureAndSendScreenshotWithLockAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await CaptureAndSendScreenshotAsync(cancellationToken);
+        }
+        finally
+        {
+            _screenshotLock.Release();
+        }
     }
 
     private void HandleTasksCommand()
@@ -1927,15 +1955,47 @@ public sealed class Worker : BackgroundService
             case "admin":
                 await HandleConfigAdminCommandAsync(parts, chatId, cancellationToken);
                 break;
+            case "alerts":
+                await HandleConfigAlertsCommandAsync(parts, cancellationToken);
+                break;
+            case "export":
+            case "raw":
+                await SendTelegramMessageOnceAsync(BuildSafeConfigurationJson(), cancellationToken);
+                break;
             case "set":
                 await HandleConfigSetCommandAsync(parts, cancellationToken);
                 break;
             default:
                 await SendTelegramMessageOnceAsync(
-                    "⚠️ Usage: /config | /config admins | /config admin add|remove [ChatId] | /config set [Key] [Value]",
+                    "⚠️ Usage: /config | /config export | /config alerts on|off | /config admins | /config admin add|remove [ChatId] | /config set [Key] [Value]",
                     cancellationToken);
                 break;
         }
+    }
+
+    private async Task HandleConfigAlertsCommandAsync(
+        string[] parts,
+        CancellationToken cancellationToken)
+    {
+        if (parts.Length < 3 || !TryParseBoolean(parts[2], out bool enabled))
+        {
+            await SendTelegramMessageOnceAsync("⚠️ Usage: /config alerts on|off", cancellationToken);
+            return;
+        }
+
+        lock (_configurationSync)
+        {
+            _configuration.AlertsEnabled = enabled;
+        }
+
+        if (!await SaveConfigurationOrReplyAsync(cancellationToken))
+        {
+            return;
+        }
+
+        await SendTelegramMessageOnceAsync(
+            enabled ? "✅ Smart alerts enabled." : "✅ Smart alerts disabled.",
+            cancellationToken);
     }
 
     private async Task HandleConfigAdminCommandAsync(
@@ -1983,10 +2043,13 @@ public sealed class Worker : BackgroundService
             case "remove":
                 if (targetChatId == requesterChatId)
                 {
-                    await SendTelegramMessageOnceAsync(
-                        "⚠️ Refusing to remove the admin that is issuing this command.",
-                        cancellationToken);
-                    return;
+                    if (GetAdminChatIdsSnapshot().Length <= 1)
+                    {
+                        await SendTelegramMessageOnceAsync(
+                            "⚠️ This is the only configured admin. Add another admin first, then remove this one.",
+                            cancellationToken);
+                        return;
+                    }
                 }
 
                 long[] currentAdmins = GetAdminChatIdsSnapshot();
@@ -2060,10 +2123,36 @@ public sealed class Worker : BackgroundService
             $"PublicIpFailureBackoffMinutes: {configuration.PublicIpFailureBackoffMinutes}",
             $"DangerousCommandConfirmationSeconds: {configuration.DangerousCommandConfirmationSeconds}",
             $"DangerousCommandCooldownSeconds: {configuration.DangerousCommandCooldownSeconds}",
-            $"ScreenshotCooldownSeconds: {configuration.ScreenshotCooldownSeconds}",
             $"MicCooldownSeconds: {configuration.MicCooldownSeconds}",
             $"AllowCrossAdminConfirmations: {configuration.AllowCrossAdminConfirmations}",
             "BotToken: configured (hidden)");
+    }
+
+    private string BuildSafeConfigurationJson()
+    {
+        AppConfiguration configuration = GetConfigurationSnapshot();
+        var safeConfiguration = new
+        {
+            botToken = "configured (hidden)",
+            adminChatIds = GetAdminChatIdsSnapshot(),
+            configuration.AlertsEnabled,
+            configuration.BatteryLowPercent,
+            configuration.DiskLowPercent,
+            configuration.HealthCheckIntervalMinutes,
+            configuration.PublicIpCacheMinutes,
+            configuration.PublicIpFailureBackoffMinutes,
+            configuration.DangerousCommandConfirmationSeconds,
+            configuration.DangerousCommandCooldownSeconds,
+            configuration.MicCooldownSeconds,
+            configuration.AllowCrossAdminConfirmations
+        };
+
+        return string.Join(
+            Environment.NewLine,
+            "⚙️ Safe config.json preview:",
+            "```json",
+            JsonSerializer.Serialize(safeConfiguration, ConfigurationJsonOptions),
+            "```");
     }
 
     private string BuildAdminsReport()
@@ -3477,7 +3566,6 @@ public sealed class Worker : BackgroundService
                 PublicIpFailureBackoffMinutes = _configuration.PublicIpFailureBackoffMinutes,
                 DangerousCommandConfirmationSeconds = _configuration.DangerousCommandConfirmationSeconds,
                 DangerousCommandCooldownSeconds = _configuration.DangerousCommandCooldownSeconds,
-                ScreenshotCooldownSeconds = _configuration.ScreenshotCooldownSeconds,
                 MicCooldownSeconds = _configuration.MicCooldownSeconds,
                 AllowCrossAdminConfirmations = _configuration.AllowCrossAdminConfirmations
             };
@@ -3603,14 +3691,6 @@ public sealed class Worker : BackgroundService
                         number => _configuration.DangerousCommandCooldownSeconds = number,
                         "DangerousCommandCooldownSeconds",
                         out result);
-                case "screenshotcooldownseconds":
-                    return TrySetIntConfigurationValue(
-                        value,
-                        0,
-                        3600,
-                        number => _configuration.ScreenshotCooldownSeconds = number,
-                        "ScreenshotCooldownSeconds",
-                        out result);
                 case "miccooldownseconds":
                     return TrySetIntConfigurationValue(
                         value,
@@ -3682,11 +3762,6 @@ public sealed class Worker : BackgroundService
     private TimeSpan GetDangerousCommandCooldown()
     {
         return TimeSpan.FromSeconds(Math.Clamp(_configuration.DangerousCommandCooldownSeconds, 0, 3600));
-    }
-
-    private TimeSpan GetScreenshotCooldown()
-    {
-        return TimeSpan.FromSeconds(Math.Clamp(_configuration.ScreenshotCooldownSeconds, 0, 3600));
     }
 
     private TimeSpan GetMicCooldown()
@@ -4788,6 +4863,7 @@ public sealed class Worker : BackgroundService
         _serviceStopping.Dispose();
         _resumeNotificationLock.Dispose();
         _micRecordingLock.Dispose();
+        _screenshotLock.Dispose();
         base.Dispose();
     }
 }

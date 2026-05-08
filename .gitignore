@@ -4,6 +4,7 @@
 build-verify/
 publish/
 artifacts/
+dist/
 TestResults/
 
 # User-specific files

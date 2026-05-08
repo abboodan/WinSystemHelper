@@ -5,6 +5,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 ## Features
 
 - Hybrid self-installing executable with interactive setup, silent install, silent uninstall, and Windows Service modes.
+- Small framework-dependent app package with a NativeAOT bootstrapper that installs missing .NET 8 runtime prerequisites.
 - Telegram Bot integration for authenticated remote administration.
 - Multi-admin command handling using the configured Telegram chat ID allowlist.
 - First-run setup wizard for interactive configuration when `config.json` is missing.
@@ -54,6 +55,8 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/services` | Lists Windows services. |
 | `/service status\|start\|stop\|restart [ServiceName]` | Queries or manages a Windows service. |
 | `/config` | Shows safe runtime configuration without exposing the bot token. |
+| `/config export` | Shows a safe `config.json` preview without exposing the bot token. |
+| `/config alerts on\|off` | Enables or disables smart alerts. |
 | `/config set [Key] [Value]` | Updates runtime configuration in `config.json`. |
 | `/config admins` | Lists configured Telegram admins. |
 | `/config admin add\|remove [ChatId]` | Adds or removes Telegram admins without reinstalling. |
@@ -64,16 +67,30 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 
 ## Build
 
-Install the .NET 8 SDK, then publish a single-file Windows executable:
+Install the .NET 8 SDK, then create the small framework-dependent release package:
+
+```powershell
+.\build.cmd
+```
+
+The NativeAOT bootstrapper publish requires the Visual Studio **Desktop development with C++** workload because Windows NativeAOT needs the platform linker. If that workload is not installed, `install.ps1` remains available as the script-based fallback.
+
+The clean release package will be under:
+
+```text
+dist\
+├─ WinSystemHelper.Bootstrapper.exe
+├─ WinSystemHelper.exe
+├─ install.ps1
+└─ README.md
+```
+
+The default package is framework-dependent to keep the app small. `WinSystemHelper.Bootstrapper.exe` checks for the .NET 8 x64 Runtime, downloads it from Microsoft if missing, installs it silently, then launches `WinSystemHelper.exe`.
+
+If you need a fully self-contained package for offline deployment, publish manually with:
 
 ```powershell
 dotnet publish .\WinSystemHelper.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true
-```
-
-The published executable will be under:
-
-```text
-bin\Release\net8.0-windows\win-x64\publish\
 ```
 
 ## Versioning
@@ -84,17 +101,23 @@ The project uses semantic versioning in `WinSystemHelper.csproj`. Each functiona
 - Minor: new commands, configuration options, alerts, or remote-management features.
 - Major: breaking configuration changes or behavior changes that require operator action.
 
-Current version: `1.1.0`.
+Current version: `1.3.0`.
 
 ## Installation
 
 Run PowerShell or Command Prompt as Administrator, then install the service with your Telegram bot token and primary admin chat ID:
 
 ```powershell
-WinSystemHelper.exe /install /token <YOUR_TOKEN> /chatid <YOUR_CHAT_ID>
+.\WinSystemHelper.Bootstrapper.exe /install /token <YOUR_TOKEN> /chatid <YOUR_CHAT_ID>
 ```
 
-This preserves the existing silent install flow, writes `config.json` next to the executable using the multi-admin format, creates the `WinSystemHelper` Windows Service, and starts it automatically.
+The bootstrapper installs missing runtime prerequisites, preserves the existing silent install flow, writes `config.json` next to the executable using the multi-admin format, creates the `WinSystemHelper` Windows Service, and starts it automatically.
+
+If the native bootstrapper is unavailable, use the PowerShell fallback from the same folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 /install /token <YOUR_TOKEN> /chatid <YOUR_CHAT_ID>
+```
 
 The generated configuration stores the provided chat ID as an array:
 
@@ -112,7 +135,7 @@ The generated configuration stores the provided chat ID as an array:
 Run the executable without arguments from an elevated console on first run:
 
 ```powershell
-WinSystemHelper.exe
+.\WinSystemHelper.Bootstrapper.exe
 ```
 
 If `config.json` is missing, the app starts the first-run setup wizard, prompts for your Telegram bot token, prompts for the primary admin chat ID, optionally accepts additional admin chat IDs, saves them to `config.json`, installs the service, and starts it.
@@ -124,7 +147,7 @@ If `config.json` already exists, the executable runs normally as the Worker Serv
 Run from an elevated shell:
 
 ```powershell
-WinSystemHelper.exe /uninstall
+.\WinSystemHelper.Bootstrapper.exe /uninstall
 ```
 
 ## Configuration
@@ -156,10 +179,11 @@ Runtime settings can be changed through Telegram without reinstalling:
 ```text
 /config set BatteryLowPercent 15
 /config set AlertsEnabled true
+/config alerts off
 /config admin add 333333333
 ```
 
-Supported runtime keys include `AlertsEnabled`, `BatteryLowPercent`, `DiskLowPercent`, `HealthCheckIntervalMinutes`, `PublicIpCacheMinutes`, `PublicIpFailureBackoffMinutes`, `DangerousCommandConfirmationSeconds`, `DangerousCommandCooldownSeconds`, `ScreenshotCooldownSeconds`, `MicCooldownSeconds`, and `AllowCrossAdminConfirmations`.
+Supported runtime keys include `AlertsEnabled`, `BatteryLowPercent`, `DiskLowPercent`, `HealthCheckIntervalMinutes`, `PublicIpCacheMinutes`, `PublicIpFailureBackoffMinutes`, `DangerousCommandConfirmationSeconds`, `DangerousCommandCooldownSeconds`, `MicCooldownSeconds`, and `AllowCrossAdminConfirmations`.
 
 Dangerous commands such as shutdown, restart, sleep, update, process termination, service control, stop, and uninstall require `/confirm [Id]` before execution.
 
@@ -177,7 +201,7 @@ Or attach a `.zip` file in Telegram with this caption:
 /update
 ```
 
-The ZIP may contain the published files directly at its root or inside one top-level folder. The service stages and extracts the package, preserves the existing `config.json`, stops itself, copies the new files into `AppContext.BaseDirectory`, restarts the `WinSystemHelper` service, and reports the result to all configured admins on the next startup.
+The ZIP may contain the published files directly at its root or inside one top-level folder. For the small framework-dependent package, zip the contents of `dist\`, including `WinSystemHelper.exe`, `WinSystemHelper.Bootstrapper.exe`, and `install.ps1`. The service stages and extracts the package, preserves the existing `config.json`, stops itself, copies the new files into `AppContext.BaseDirectory`, restarts the `WinSystemHelper` service, and reports the result to all configured admins on the next startup.
 
 Updates use the existing admin chat allowlist as the trust boundary. The updater creates a backup before copying files and attempts rollback if the copy fails.
 
