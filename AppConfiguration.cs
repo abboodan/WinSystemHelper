@@ -29,7 +29,15 @@ public sealed class AppConfiguration
 
     public int MicCooldownSeconds { get; set; } = 30;
 
+    public bool PersistentMicLoopEnabled { get; set; } = true;
+
     public bool AllowCrossAdminConfirmations { get; set; }
+
+    public bool PowerEventAlertsEnabled { get; set; } = true;
+
+    public bool PowerEventOutboxEnabled { get; set; } = true;
+
+    public int PowerCommandPreDelaySeconds { get; set; } = 3;
 
     public IReadOnlyList<long> GetEffectiveAdminChatIds()
     {

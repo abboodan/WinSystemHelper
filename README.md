@@ -10,12 +10,14 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 - Multi-admin command handling using the configured Telegram chat ID allowlist.
 - First-run setup wizard for interactive configuration when `config.json` is missing.
 - Startup and wake-from-sleep alerts.
+- Shutdown, restart, and sleep transition alerts with a persistent next-boot outbox.
 - Modern Standby-compatible wake detection through the Windows System event log.
 - Fail-fast Telegram configuration validation to avoid endless retries on invalid credentials.
 - Resilient Telegram polling with exponential backoff and strict network timeouts.
 - Session 0-aware command execution for workstation lock and alert sound behavior using active-user-session process launching.
 - Interactive active-user prompts using Base64-encoded PowerShell UI scripts.
 - Overt active-alarm microphone recording with local visual/audio warnings.
+- Optional persistent active-alarm mic loop restore after reboot, controlled by `PersistentMicLoopEnabled`.
 - Admin-only OTA self-update from a Telegram ZIP document or HTTPS ZIP URL.
 - Confirmation gates and cooldowns for dangerous remote commands.
 - Lightweight health, network, service, disk, battery, and public-IP monitoring without WMI-heavy polling.
@@ -187,6 +189,28 @@ Supported runtime keys include `AlertsEnabled`, `BatteryLowPercent`, `DiskLowPer
 
 Dangerous commands such as shutdown, restart, sleep, update, process termination, service control, stop, and uninstall require `/confirm [Id]` before execution.
 
+## Power Event Alerts
+
+Shutdown, restart, and sleep commands sent through Telegram broadcast an alert before the system action starts. The service also watches the Windows System event log for local shutdown/restart requests and sleep transitions, then attempts to notify all configured admins.
+
+If the machine powers off before Telegram delivery completes, a small JSON report is stored under the shared `PowerEvents` temp folder and sent on the next service startup. Power event alerts can be controlled remotely:
+
+```text
+/config set PowerEventAlertsEnabled false
+/config set PowerEventOutboxEnabled true
+/config set PowerCommandPreDelaySeconds 3
+```
+
+## Persistent Active Alarm Mic Loop
+
+When `PersistentMicLoopEnabled` is true, `/mic [seconds] loop` stores only the active loop state under the shared `Audio` folder. If the laptop shuts down or restarts while the loop is active, the service restores the overt recording loop after startup and continues until an admin sends:
+
+```text
+/mic stop
+```
+
+The feature does not persist audio files. Each recording cycle still shows the local visual warning and plays the audible warning before recording.
+
 ## OTA Self-Update
 
 Authorized admins can update an endpoint remotely with a ZIP package:
@@ -204,6 +228,18 @@ Or attach a `.zip` file in Telegram with this caption:
 The ZIP may contain the published files directly at its root or inside one top-level folder. For the small framework-dependent package, zip the contents of `dist\`, including `WinSystemHelper.exe`, `WinSystemHelper.Bootstrapper.exe`, and `install.ps1`. The service stages and extracts the package, preserves the existing `config.json`, stops itself, copies the new files into `AppContext.BaseDirectory`, restarts the `WinSystemHelper` service, and reports the result to all configured admins on the next startup.
 
 Updates use the existing admin chat allowlist as the trust boundary. The updater creates a backup before copying files and attempts rollback if the copy fails.
+
+### OTA Safety Checks
+
+Before stopping the service, `/update` verifies that the endpoint is safe to restart:
+
+- `config.json` must exist beside the currently running service executable and contain a bot token plus at least one admin chat ID.
+- The Windows Service `binPath` must match the currently running `WinSystemHelper.exe`.
+- The service must not be running from a build output folder such as `bin\Debug` or `bin\Release`; install from a clean deployment folder first.
+- The .NET 8 x64 Runtime must be installed because the default package is framework-dependent.
+- The ZIP must contain a non-empty `WinSystemHelper.exe` at the payload root and must not include `config.json`.
+
+If any check fails, the bot rejects the update with a clear warning and keeps the existing service running.
 
 ## Security Disclaimer
 

@@ -61,9 +61,14 @@ public sealed class Worker : BackgroundService
     private const string ConfigFileName = "config.json";
     private const string ZipExtension = ".zip";
     private const string UpdateStatusMarkerFileName = "WinSystemHelper-update-status.txt";
+    private const string MicLoopStateFileName = "mic-loop-state.json";
     private const string WakeEventLogName = "System";
     private const string WakeEventLogQuery =
         "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]";
+    private const string PowerEventLogName = "System";
+    private const string PowerEventLogQuery =
+        "*[System[(Provider[@Name='User32'] and EventID=1074) or (Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=42)]]";
+    private const int MaxPowerEventOutboxFiles = 20;
 
     [DllImport("kernel32.dll")]
     private static extern uint WTSGetActiveConsoleSessionId();
@@ -125,11 +130,14 @@ public sealed class Worker : BackgroundService
     private readonly object _alertStateSync = new();
     private readonly object _micLoopSync = new();
     private readonly object _wakeEventWatcherSync = new();
+    private readonly object _powerEventWatcherSync = new();
+    private readonly object _powerEventSync = new();
     private readonly CancellationTokenSource _serviceStopping = new();
     private readonly DateTimeOffset _startedAt = DateTimeOffset.Now;
     private readonly Stopwatch _uptime = Stopwatch.StartNew();
     private CancellationTokenSource? _micLoopCts;
     private EventLogWatcher? _wakeEventWatcher;
+    private EventLogWatcher? _powerEventWatcher;
     private string? _cachedPublicIp;
     private DateTimeOffset? _publicIpFetchedAt;
     private DateTimeOffset? _publicIpNextAttemptAt;
@@ -142,11 +150,14 @@ public sealed class Worker : BackgroundService
     private string? _lastPublicIpAlerted;
     private DateTimeOffset? _micLoopStartedAt;
     private long _lastWakeEventRecordId;
+    private long _lastPowerEventRecordId;
     private int _telegramPollingFailureStreak;
     private int _publicIpFailureCount;
     private bool _batteryLowAlertActive;
     private bool _diskLowAlertActive;
     private bool _micLoopLongAlertSent;
+    private PowerEventKind _lastBotPowerCommandKind = PowerEventKind.Unknown;
+    private DateTimeOffset _lastBotPowerCommandAt = DateTimeOffset.MinValue;
     private bool _repeatedTelegramFailureAlertActive;
 
     public Worker(
@@ -167,6 +178,7 @@ public sealed class Worker : BackgroundService
     public override Task StartAsync(CancellationToken cancellationToken)
     {
         RegisterWakeEventWatcher();
+        RegisterPowerEventWatcher();
         return base.StartAsync(cancellationToken);
     }
 
@@ -175,6 +187,7 @@ public sealed class Worker : BackgroundService
         CancelMicLoop();
         _serviceStopping.Cancel();
         UnregisterWakeEventWatcher();
+        UnregisterPowerEventWatcher();
         return base.StopAsync(cancellationToken);
     }
 
@@ -192,7 +205,9 @@ public sealed class Worker : BackgroundService
         }
 
         QueueBackgroundWork(SendPendingUpdateStatusAsync, "Update status report failed.");
+        QueueBackgroundWork(SendPendingPowerEventReportsAsync, "Pending power event report failed.");
         QueueBackgroundWork(SendStartupAlertAsync, "Startup alert failed.");
+        QueueBackgroundWork(RestorePersistentMicLoopAsync, "Persistent mic loop restore failed.");
         QueueBackgroundWork(RunSmartAlertLoopAsync, "Smart alert loop failed.");
         await RegisterTelegramMenuAsync(workerStopping.Token);
 
@@ -435,6 +450,66 @@ public sealed class Worker : BackgroundService
         }
     }
 
+    private void RegisterPowerEventWatcher()
+    {
+        lock (_powerEventWatcherSync)
+        {
+            if (_powerEventWatcher is not null)
+            {
+                return;
+            }
+
+            try
+            {
+                EventLogQuery query = new(PowerEventLogName, PathType.LogName, PowerEventLogQuery);
+                EventLogWatcher watcher = new(query);
+                watcher.EventRecordWritten += OnPowerEventRecordWritten;
+                watcher.Enabled = true;
+
+                _powerEventWatcher = watcher;
+                _logger.LogInformation("Registered power event detector for User32 1074 and Kernel-Power 42.");
+            }
+            catch (Exception ex) when (ex is EventLogException or UnauthorizedAccessException)
+            {
+                _logger.LogError(ex, "Failed to register power event detector against the Windows System event log.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected failure while registering the Windows System event log power detector.");
+            }
+        }
+    }
+
+    private void UnregisterPowerEventWatcher()
+    {
+        EventLogWatcher? watcher;
+
+        lock (_powerEventWatcherSync)
+        {
+            watcher = _powerEventWatcher;
+            _powerEventWatcher = null;
+        }
+
+        if (watcher is null)
+        {
+            return;
+        }
+
+        try
+        {
+            watcher.Enabled = false;
+            watcher.EventRecordWritten -= OnPowerEventRecordWritten;
+            watcher.Dispose();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to unregister power event log watcher cleanly.");
+        }
+    }
+
     private void OnWakeEventRecordWritten(object? sender, EventRecordWrittenEventArgs e)
     {
         if (e.EventException is not null)
@@ -467,6 +542,57 @@ public sealed class Worker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to process Power-Troubleshooter resume event.");
+        }
+        finally
+        {
+            record.Dispose();
+        }
+    }
+
+    private void OnPowerEventRecordWritten(object? sender, EventRecordWrittenEventArgs e)
+    {
+        if (e.EventException is not null)
+        {
+            _logger.LogWarning(e.EventException, "Power event log watcher reported an error.");
+            return;
+        }
+
+        EventRecord? record = e.EventRecord;
+        if (record is null)
+        {
+            return;
+        }
+
+        try
+        {
+            long? recordId = record.RecordId;
+            if (recordId.HasValue &&
+                Interlocked.Exchange(ref _lastPowerEventRecordId, recordId.Value) == recordId.Value)
+            {
+                return;
+            }
+
+            PowerEventReport report = BuildPowerEventReportFromEventLog(record);
+            if (ShouldSuppressDuplicateBotPowerEvent(report.Kind))
+            {
+                _logger.LogDebug(
+                    "Suppressed duplicate Windows power event {PowerEventKind} after bot command.",
+                    report.Kind);
+                return;
+            }
+
+            _logger.LogInformation(
+                "Windows power event detected. Kind: {PowerEventKind}. EventRecordId: {EventRecordId}.",
+                report.Kind,
+                recordId);
+
+            QueueBackgroundWork(
+                token => HandleDetectedPowerEventAsync(report, token),
+                "Power event alert failed.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to process Windows power event.");
         }
         finally
         {
@@ -509,6 +635,297 @@ public sealed class Worker : BackgroundService
         finally
         {
             _resumeNotificationLock.Release();
+        }
+    }
+
+    private async Task HandleDetectedPowerEventAsync(
+        PowerEventReport report,
+        CancellationToken cancellationToken)
+    {
+        string? outboxPath = await SavePowerEventOutboxAsync(report, delivered: false, cancellationToken);
+
+        if (!GetPowerEventAlertsEnabled())
+        {
+            return;
+        }
+
+        try
+        {
+            if (await SendTelegramBroadcastOnceAsync(report.Message, cancellationToken))
+            {
+                await MarkPowerEventDeliveredAsync(outboxPath, report, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Power event alert could not be delivered before the power transition.");
+        }
+    }
+
+    private async Task SendPendingPowerEventReportsAsync(CancellationToken cancellationToken)
+    {
+        if (!GetPowerEventAlertsEnabled() || !GetPowerEventOutboxEnabled())
+        {
+            return;
+        }
+
+        string directory = GetSharedTempDirectory("PowerEvents");
+        if (!Directory.Exists(directory))
+        {
+            return;
+        }
+
+        foreach (string file in Directory.EnumerateFiles(directory, "*.json").OrderBy(File.GetCreationTimeUtc))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                string json = await File.ReadAllTextAsync(file, Encoding.UTF8, cancellationToken);
+                PowerEventReport? report = JsonSerializer.Deserialize<PowerEventReport>(json, ConfigurationJsonOptions);
+                if (report is null)
+                {
+                    DeleteTempFile(file);
+                    continue;
+                }
+
+                if (report.Delivered)
+                {
+                    DeleteTempFile(file);
+                    continue;
+                }
+
+                bool delivered = await SendTelegramBroadcastOnceAsync(
+                    $"⚠️ Previous power event report: {report.Message} Detected: {report.DetectedAt:yyyy-MM-dd HH:mm:ss zzz}.",
+                    cancellationToken);
+
+                if (delivered)
+                {
+                    DeleteTempFile(file);
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to process pending power event report {PowerEventFile}.", file);
+            }
+        }
+
+        TrimPowerEventOutbox();
+    }
+
+    private static PowerEventReport BuildPowerEventReportFromEventLog(EventRecord record)
+    {
+        string providerName = record.ProviderName ?? "Unknown";
+        int eventId = record.Id;
+        string description = SafeFormatEventDescription(record);
+        PowerEventKind kind = DeterminePowerEventKind(providerName, eventId, description);
+        string message = kind switch
+        {
+            PowerEventKind.Shutdown => "🛑 Windows shutdown detected from the local system.",
+            PowerEventKind.Restart => "🔄 Windows restart detected from the local system.",
+            PowerEventKind.Sleep => "🌙 Windows sleep detected from the local system.",
+            _ => "⚠️ Unknown Windows power event detected from the local system."
+        };
+
+        if (!string.IsNullOrWhiteSpace(description))
+        {
+            message = $"{message} Event: {TruncateForTelegram(NormalizeWhitespace(description), 500)}";
+        }
+
+        return new PowerEventReport
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            Kind = kind,
+            Source = PowerEventSource.WindowsEventLog,
+            DetectedAt = DateTimeOffset.Now,
+            Message = message,
+            Delivered = false
+        };
+    }
+
+    private static PowerEventReport CreatePowerEventReport(
+        PowerEventKind kind,
+        PowerEventSource source,
+        string message)
+    {
+        return new PowerEventReport
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            Kind = kind,
+            Source = source,
+            DetectedAt = DateTimeOffset.Now,
+            Message = message,
+            Delivered = false
+        };
+    }
+
+    private async Task<string?> SavePowerEventOutboxAsync(
+        PowerEventReport report,
+        bool delivered,
+        CancellationToken cancellationToken)
+    {
+        if (!GetPowerEventOutboxEnabled())
+        {
+            return null;
+        }
+
+        try
+        {
+            string directory = GetSharedTempDirectory("PowerEvents");
+            Directory.CreateDirectory(directory);
+            TrimPowerEventOutbox();
+
+            report.Delivered = delivered;
+            string filePath = Path.Combine(
+                directory,
+                $"WinSystemHelper-power-{report.DetectedAt:yyyyMMddHHmmssfff}-{report.Id}.json");
+
+            string json = JsonSerializer.Serialize(report, ConfigurationJsonOptions);
+            await File.WriteAllTextAsync(filePath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), cancellationToken);
+            return filePath;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            _logger.LogWarning(ex, "Failed to write power event outbox item.");
+            return null;
+        }
+    }
+
+    private async Task MarkPowerEventDeliveredAsync(
+        string? outboxPath,
+        PowerEventReport report,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(outboxPath) || !File.Exists(outboxPath))
+        {
+            return;
+        }
+
+        try
+        {
+            report.Delivered = true;
+            string json = JsonSerializer.Serialize(report, ConfigurationJsonOptions);
+            await File.WriteAllTextAsync(outboxPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            _logger.LogWarning(ex, "Failed to mark power event outbox item as delivered.");
+        }
+    }
+
+    private void TrimPowerEventOutbox()
+    {
+        if (!GetPowerEventOutboxEnabled())
+        {
+            return;
+        }
+
+        try
+        {
+            string directory = GetSharedTempDirectory("PowerEvents");
+            if (!Directory.Exists(directory))
+            {
+                return;
+            }
+
+            FileInfo[] files = new DirectoryInfo(directory)
+                .EnumerateFiles("*.json")
+                .OrderByDescending(file => file.LastWriteTimeUtc)
+                .ToArray();
+
+            foreach (FileInfo file in files.Skip(MaxPowerEventOutboxFiles))
+            {
+                DeleteTempFile(file.FullName);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            _logger.LogWarning(ex, "Failed to trim power event outbox.");
+        }
+    }
+
+    private static string SafeFormatEventDescription(EventRecord record)
+    {
+        try
+        {
+            return record.FormatDescription() ?? string.Empty;
+        }
+        catch (Exception ex) when (ex is EventLogException or InvalidOperationException)
+        {
+            return string.Empty;
+        }
+    }
+
+    private static PowerEventKind DeterminePowerEventKind(
+        string providerName,
+        int eventId,
+        string description)
+    {
+        if (providerName.Equals("Microsoft-Windows-Kernel-Power", StringComparison.OrdinalIgnoreCase) &&
+            eventId == 42)
+        {
+            return PowerEventKind.Sleep;
+        }
+
+        if (providerName.Equals("User32", StringComparison.OrdinalIgnoreCase) && eventId == 1074)
+        {
+            if (description.Contains("restart", StringComparison.OrdinalIgnoreCase))
+            {
+                return PowerEventKind.Restart;
+            }
+
+            if (description.Contains("shutdown", StringComparison.OrdinalIgnoreCase) ||
+                description.Contains("shut down", StringComparison.OrdinalIgnoreCase) ||
+                description.Contains("power off", StringComparison.OrdinalIgnoreCase))
+            {
+                return PowerEventKind.Shutdown;
+            }
+        }
+
+        return PowerEventKind.Unknown;
+    }
+
+    private static string NormalizeWhitespace(string value)
+    {
+        return string.Join(' ', value.Split(default(string[]), StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    private void MarkRecentBotPowerCommand(PowerEventKind kind)
+    {
+        lock (_powerEventSync)
+        {
+            _lastBotPowerCommandKind = kind;
+            _lastBotPowerCommandAt = DateTimeOffset.Now;
+        }
+    }
+
+    private bool ShouldSuppressDuplicateBotPowerEvent(PowerEventKind kind)
+    {
+        if (kind == PowerEventKind.Unknown)
+        {
+            return false;
+        }
+
+        lock (_powerEventSync)
+        {
+            return _lastBotPowerCommandKind == kind &&
+                DateTimeOffset.Now - _lastBotPowerCommandAt <= TimeSpan.FromSeconds(30);
         }
     }
 
@@ -1075,20 +1492,72 @@ public sealed class Worker : BackgroundService
 
     private async Task ShutdownAsync(CancellationToken cancellationToken)
     {
-        await SendTelegramMessageOnceAsync("🛑 Initiating shutdown in 10 seconds...", cancellationToken);
-        StartDetachedProcess("shutdown.exe", "-s -t 10");
+        await ExecutePowerCommandAsync(
+            PowerEventKind.Shutdown,
+            "🛑 Shutdown requested. The laptop will shut down in 10 seconds.",
+            "shutdown.exe",
+            "-s -t 10",
+            cancellationToken);
     }
 
     private async Task RestartAsync(CancellationToken cancellationToken)
     {
-        await SendTelegramMessageOnceAsync("🔄 Initiating system restart in 10 seconds...", cancellationToken);
-        StartDetachedProcess("shutdown.exe", "-r -t 10");
+        await ExecutePowerCommandAsync(
+            PowerEventKind.Restart,
+            "🔄 Restart requested. The laptop will restart in 10 seconds.",
+            "shutdown.exe",
+            "-r -t 10",
+            cancellationToken);
     }
 
     private async Task SleepAsync(CancellationToken cancellationToken)
     {
-        await SendTelegramMessageOnceAsync("🌙 Putting the workstation to sleep...", cancellationToken);
-        StartDetachedProcess("rundll32.exe", "powrprof.dll,SetSuspendState 0,1,0");
+        await ExecutePowerCommandAsync(
+            PowerEventKind.Sleep,
+            "🌙 Sleep requested. The laptop is entering sleep mode.",
+            "rundll32.exe",
+            "powrprof.dll,SetSuspendState 0,1,0",
+            cancellationToken);
+    }
+
+    private async Task ExecutePowerCommandAsync(
+        PowerEventKind kind,
+        string message,
+        string fileName,
+        string arguments,
+        CancellationToken cancellationToken)
+    {
+        PowerEventReport report = CreatePowerEventReport(kind, PowerEventSource.BotCommand, message);
+        string? outboxPath = await SavePowerEventOutboxAsync(report, delivered: false, cancellationToken);
+
+        MarkRecentBotPowerCommand(kind);
+
+        if (GetPowerEventAlertsEnabled())
+        {
+            try
+            {
+                if (await SendTelegramBroadcastOnceAsync(message, cancellationToken))
+                {
+                    await MarkPowerEventDeliveredAsync(outboxPath, report, cancellationToken);
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Power command alert failed before executing {PowerEventKind}.", kind);
+            }
+        }
+
+        TimeSpan preDelay = GetPowerCommandPreDelay();
+        if (preDelay > TimeSpan.Zero)
+        {
+            await Task.Delay(preDelay, cancellationToken);
+        }
+
+        StartDetachedProcess(fileName, arguments);
     }
 
     private async Task HandlePublicIpCommandAsync(string commandText, CancellationToken cancellationToken)
@@ -2124,7 +2593,11 @@ public sealed class Worker : BackgroundService
             $"DangerousCommandConfirmationSeconds: {configuration.DangerousCommandConfirmationSeconds}",
             $"DangerousCommandCooldownSeconds: {configuration.DangerousCommandCooldownSeconds}",
             $"MicCooldownSeconds: {configuration.MicCooldownSeconds}",
+            $"PersistentMicLoopEnabled: {configuration.PersistentMicLoopEnabled}",
             $"AllowCrossAdminConfirmations: {configuration.AllowCrossAdminConfirmations}",
+            $"PowerEventAlertsEnabled: {configuration.PowerEventAlertsEnabled}",
+            $"PowerEventOutboxEnabled: {configuration.PowerEventOutboxEnabled}",
+            $"PowerCommandPreDelaySeconds: {configuration.PowerCommandPreDelaySeconds}",
             "BotToken: configured (hidden)");
     }
 
@@ -2144,7 +2617,11 @@ public sealed class Worker : BackgroundService
             configuration.DangerousCommandConfirmationSeconds,
             configuration.DangerousCommandCooldownSeconds,
             configuration.MicCooldownSeconds,
-            configuration.AllowCrossAdminConfirmations
+            configuration.PersistentMicLoopEnabled,
+            configuration.AllowCrossAdminConfirmations,
+            configuration.PowerEventAlertsEnabled,
+            configuration.PowerEventOutboxEnabled,
+            configuration.PowerCommandPreDelaySeconds
         };
 
         return string.Join(
@@ -2177,6 +2654,13 @@ public sealed class Worker : BackgroundService
             await SendTelegramMessageOnceAsync(
                 "⚠️ Usage: send /update https://example.com/update.zip or attach a .zip file with caption /update.",
                 cancellationToken);
+            return;
+        }
+
+        string? preflightError = await ValidateOtaPreflightAsync(cancellationToken);
+        if (!string.IsNullOrWhiteSpace(preflightError))
+        {
+            await SendTelegramMessageOnceAsync(preflightError, cancellationToken);
             return;
         }
 
@@ -2296,6 +2780,200 @@ public sealed class Worker : BackgroundService
 
             _updateLock.Release();
         }
+    }
+
+    private async Task<string?> ValidateOtaPreflightAsync(CancellationToken cancellationToken)
+    {
+        string baseDirectory = AppContext.BaseDirectory;
+        string configPath = Path.Combine(baseDirectory, ConfigFileName);
+
+        if (!File.Exists(configPath))
+        {
+            return $"⚠️ Update blocked: {ConfigFileName} is missing beside the service executable. Reinstall from the final dist folder first.";
+        }
+
+        try
+        {
+            string json = await File.ReadAllTextAsync(configPath, cancellationToken);
+            AppConfiguration? configuration =
+                JsonSerializer.Deserialize<AppConfiguration>(json, ConfigurationJsonOptions);
+
+            if (configuration is null ||
+                string.IsNullOrWhiteSpace(configuration.BotToken) ||
+                configuration.GetEffectiveAdminChatIds().Count == 0)
+            {
+                return $"⚠️ Update blocked: {ConfigFileName} is missing BotToken or AdminChatIds.";
+            }
+        }
+        catch (JsonException ex)
+        {
+            return $"⚠️ Update blocked: {ConfigFileName} is not valid JSON. {ex.Message}";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            return $"⚠️ Update blocked: unable to read {ConfigFileName}. {ex.Message}";
+        }
+
+        if (IsBuildOutputDirectory(baseDirectory))
+        {
+            return "⚠️ Update blocked: service is running from a build/debug folder. Install from a clean dist folder first.";
+        }
+
+        string currentExecutablePath = Path.GetFullPath(GetCurrentExecutablePath());
+        string? serviceExecutablePath;
+        try
+        {
+            serviceExecutablePath = await GetConfiguredServiceExecutablePathAsync(cancellationToken);
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or System.TimeoutException)
+        {
+            return $"⚠️ Update blocked: unable to query the WinSystemHelper service path. {ex.Message}";
+        }
+
+        if (string.IsNullOrWhiteSpace(serviceExecutablePath))
+        {
+            return "⚠️ Update blocked: unable to read the WinSystemHelper service executable path from sc.exe.";
+        }
+
+        if (!PathsEqual(currentExecutablePath, serviceExecutablePath))
+        {
+            return $"⚠️ Update blocked: service binPath does not match the running executable. Service: {serviceExecutablePath}";
+        }
+
+        if (!await HasDotNet8RuntimeAsync(cancellationToken))
+        {
+            return "⚠️ Update blocked: .NET 8 Runtime is missing. Run the bootstrapper installer first.";
+        }
+
+        return null;
+    }
+
+    private static async Task<string?> GetConfiguredServiceExecutablePathAsync(CancellationToken cancellationToken)
+    {
+        ProcessCaptureResult result = await RunProcessCaptureAsync(
+            "sc.exe",
+            $"qc {ServiceName}",
+            TimeSpan.FromSeconds(10),
+            cancellationToken);
+
+        if (result.ExitCode != 0)
+        {
+            return null;
+        }
+
+        foreach (string line in result.StandardOutput.Split(
+            ['\r', '\n'],
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            int separatorIndex = line.IndexOf(':');
+            if (separatorIndex < 0)
+            {
+                continue;
+            }
+
+            string key = line[..separatorIndex].Trim();
+            if (!key.Equals("BINARY_PATH_NAME", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            string value = line[(separatorIndex + 1)..].Trim();
+            string? executablePath = ExtractExecutablePathFromCommandLine(value);
+            return string.IsNullOrWhiteSpace(executablePath)
+                ? null
+                : Path.GetFullPath(executablePath);
+        }
+
+        return null;
+    }
+
+    private static async Task<bool> HasDotNet8RuntimeAsync(CancellationToken cancellationToken)
+    {
+        if (HasDotNet8RuntimeInRegistry())
+        {
+            return true;
+        }
+
+        try
+        {
+            ProcessCaptureResult result = await RunProcessCaptureAsync(
+                "dotnet.exe",
+                "--list-runtimes",
+                TimeSpan.FromSeconds(10),
+                cancellationToken);
+
+            return result.ExitCode == 0 &&
+                result.StandardOutput
+                    .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+                    .Any(line => line.StartsWith("Microsoft.NETCore.App 8.", StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or System.TimeoutException)
+        {
+            return false;
+        }
+    }
+
+    private static bool HasDotNet8RuntimeInRegistry()
+    {
+        const string runtimeKeyPath =
+            @"SOFTWARE\dotnet\Setup\InstalledVersions\x64\sharedfx\Microsoft.NETCore.App";
+
+        try
+        {
+            using RegistryKey? runtimeKey = Registry.LocalMachine.OpenSubKey(runtimeKeyPath);
+            return runtimeKey?.GetValueNames()
+                .Any(name => name.StartsWith("8.", StringComparison.OrdinalIgnoreCase)) == true;
+        }
+        catch (Exception ex) when (ex is SecurityException or IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static bool IsBuildOutputDirectory(string directory)
+    {
+        string[] parts = Path.GetFullPath(directory)
+            .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries);
+
+        for (int i = 0; i < parts.Length - 1; i++)
+        {
+            if (parts[i].Equals("bin", StringComparison.OrdinalIgnoreCase) &&
+                (parts[i + 1].Equals("Debug", StringComparison.OrdinalIgnoreCase) ||
+                 parts[i + 1].Equals("Release", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string? ExtractExecutablePathFromCommandLine(string commandLine)
+    {
+        string trimmed = commandLine.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return null;
+        }
+
+        if (trimmed[0] == '"')
+        {
+            int closingQuoteIndex = trimmed.IndexOf('"', 1);
+            return closingQuoteIndex > 1 ? trimmed[1..closingQuoteIndex] : null;
+        }
+
+        int executableExtensionIndex = trimmed.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+        return executableExtensionIndex < 0
+            ? trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()
+            : trimmed[..(executableExtensionIndex + 4)];
+    }
+
+    private static bool PathsEqual(string left, string right)
+    {
+        return string.Equals(
+            Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task DownloadTelegramUpdatePackageAsync(
@@ -2447,6 +3125,19 @@ public sealed class Worker : BackgroundService
         {
             throw new InvalidOperationException(
                 $"Update package must contain {expectedExecutableName} at the payload root.");
+        }
+
+        FileInfo executableInfo = new(expectedExecutablePath);
+        if (executableInfo.Length == 0)
+        {
+            throw new InvalidOperationException(
+                $"Update package contains an empty {expectedExecutableName} file.");
+        }
+
+        if (Directory.EnumerateFiles(payloadRoot, ConfigFileName, SearchOption.AllDirectories).Any())
+        {
+            throw new InvalidOperationException(
+                $"Update package must not include {ConfigFileName}. Existing local configuration is preserved.");
         }
     }
 
@@ -2799,6 +3490,19 @@ public sealed class Worker : BackgroundService
 
     private async Task StartMicAlarmLoopAsync(int durationSeconds, CancellationToken cancellationToken)
     {
+        await StartMicAlarmLoopCoreAsync(
+            durationSeconds,
+            persistState: true,
+            restoredFromStartup: false,
+            cancellationToken);
+    }
+
+    private async Task StartMicAlarmLoopCoreAsync(
+        int durationSeconds,
+        bool persistState,
+        bool restoredFromStartup,
+        CancellationToken cancellationToken)
+    {
         CancellationTokenSource? loopCts = null;
 
         lock (_micLoopSync)
@@ -2822,9 +3526,23 @@ public sealed class Worker : BackgroundService
 
         try
         {
-            await SendTelegramMessageOnceAsync(
+            if (persistState && GetPersistentMicLoopEnabled())
+            {
+                await SavePersistentMicLoopStateAsync(durationSeconds, cancellationToken);
+            }
+
+            if (restoredFromStartup)
+            {
+                await SendTelegramMessageOnceAsync(
+                    $"🎤 Persistent Active Alarm restored after startup. Recording loop resumed ({durationSeconds}s cycles).",
+                    cancellationToken);
+            }
+            else
+            {
+                await SendTelegramMessageOnceAsync(
                 $"🎤 Persistent Active Alarm loop started ({durationSeconds}s cycles).",
                 cancellationToken);
+            }
 
             _ = Task.Run(
                 () => RunMicAlarmLoopAsync(durationSeconds, loopCts),
@@ -2850,10 +3568,108 @@ public sealed class Worker : BackgroundService
     private async Task StopMicAlarmLoopAsync(CancellationToken cancellationToken)
     {
         CancelMicLoop();
+        DeletePersistentMicLoopState();
 
         await SendTelegramMessageOnceAsync(
             "🛑 Persistent Active Alarm stopped.",
             cancellationToken);
+    }
+
+    private async Task RestorePersistentMicLoopAsync(CancellationToken cancellationToken)
+    {
+        if (!GetPersistentMicLoopEnabled())
+        {
+            return;
+        }
+
+        PersistentMicLoopState? state = await ReadPersistentMicLoopStateAsync(cancellationToken);
+        if (state is null || !state.Active)
+        {
+            return;
+        }
+
+        int durationSeconds = Math.Clamp(
+            state.DurationSeconds <= 0 ? DefaultMicRecordingSeconds : state.DurationSeconds,
+            1,
+            MaxMicRecordingSeconds);
+
+        await StartMicAlarmLoopCoreAsync(
+            durationSeconds,
+            persistState: false,
+            restoredFromStartup: true,
+            cancellationToken);
+    }
+
+    private async Task SavePersistentMicLoopStateAsync(
+        int durationSeconds,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            PersistentMicLoopState state = new()
+            {
+                Active = true,
+                DurationSeconds = Math.Clamp(durationSeconds, 1, MaxMicRecordingSeconds),
+                StartedAt = DateTimeOffset.Now,
+                RequestedByAdminChatId = GetReplyChatId()
+            };
+
+            string statePath = GetPersistentMicLoopStatePath();
+            Directory.CreateDirectory(Path.GetDirectoryName(statePath)!);
+            string tempPath = $"{statePath}.{Guid.NewGuid():N}.tmp";
+            string json = JsonSerializer.Serialize(state, ConfigurationJsonOptions);
+
+            await File.WriteAllTextAsync(
+                tempPath,
+                json,
+                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                cancellationToken);
+
+            File.Move(tempPath, statePath, overwrite: true);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            _logger.LogWarning(ex, "Failed to save persistent mic loop state.");
+        }
+    }
+
+    private async Task<PersistentMicLoopState?> ReadPersistentMicLoopStateAsync(CancellationToken cancellationToken)
+    {
+        string statePath = GetPersistentMicLoopStatePath();
+        if (!File.Exists(statePath))
+        {
+            return null;
+        }
+
+        try
+        {
+            string json = await File.ReadAllTextAsync(statePath, Encoding.UTF8, cancellationToken);
+            return JsonSerializer.Deserialize<PersistentMicLoopState>(json, ConfigurationJsonOptions);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            _logger.LogWarning(ex, "Failed to read persistent mic loop state. Removing invalid state file.");
+            DeletePersistentMicLoopState();
+            return null;
+        }
+    }
+
+    private void DeletePersistentMicLoopState()
+    {
+        DeleteTempFile(GetPersistentMicLoopStatePath());
+    }
+
+    private static string GetPersistentMicLoopStatePath()
+    {
+        return Path.Combine(GetSharedTempDirectory("Audio"), MicLoopStateFileName);
     }
 
     private async Task RunMicAlarmLoopAsync(int durationSeconds, CancellationTokenSource loopCts)
@@ -3222,6 +4038,7 @@ public sealed class Worker : BackgroundService
             $StatusMarkerPath = Decode-Base64Utf8 '{{encodedStatusMarkerPath}}'
             $LogPath = Decode-Base64Utf8 '{{encodedLogPath}}'
             $ConfigFileName = '{{ConfigFileName}}'
+            $UpdateSucceeded = $false
             $PathTrimChars = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
 
             function Write-Log([string]$message) {
@@ -3309,8 +4126,26 @@ public sealed class Worker : BackgroundService
             }
 
             function Start-TargetService {
-                & sc.exe start $ServiceName | Out-Null
-                Write-Log "Service start requested."
+                $startOutput = & sc.exe start $ServiceName 2>&1
+                $startExitCode = $LASTEXITCODE
+                Write-Log "Service start requested. ExitCode=$startExitCode Output=$($startOutput -join ' ')"
+
+                if ($startExitCode -ne 0 -and $startExitCode -ne 1056) {
+                    throw "sc.exe start failed with exit code $startExitCode. Output: $($startOutput -join ' ')"
+                }
+
+                $deadline = (Get-Date).AddSeconds(30)
+                do {
+                    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+                    if ($null -ne $service -and $service.Status -eq 'Running') {
+                        Write-Log "Service is running."
+                        return
+                    }
+
+                    Start-Sleep -Seconds 1
+                } while ((Get-Date) -lt $deadline)
+
+                throw "Service did not reach RUNNING state within 30 seconds after start."
             }
 
             try {
@@ -3329,8 +4164,9 @@ public sealed class Worker : BackgroundService
                 Write-Log "Copying staged update files."
                 Copy-Tree -source $PayloadRoot -destination $TargetDirectory
 
-                Write-UpdateStatus "✅ OTA update applied successfully at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')."
                 Start-TargetService
+                $UpdateSucceeded = $true
+                Write-UpdateStatus "✅ OTA update applied successfully at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')."
                 Write-Log "OTA update completed successfully."
             }
             catch {
@@ -3357,11 +4193,12 @@ public sealed class Worker : BackgroundService
                 }
                 catch {
                     Write-Log "Service restart failed after update failure: $($_.Exception.Message)"
+                    Write-UpdateStatus "🚨 OTA update failed and the service could not be restarted at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'). Error: $failureMessage Restart error: $($_.Exception.Message)"
                 }
             }
             finally {
                 try {
-                    if (Test-Path -LiteralPath $UpdateRoot) {
+                    if ($UpdateSucceeded -and (Test-Path -LiteralPath $UpdateRoot)) {
                         Remove-Item -LiteralPath $UpdateRoot -Recurse -Force -ErrorAction SilentlyContinue
                     }
                 }
@@ -3567,7 +4404,11 @@ public sealed class Worker : BackgroundService
                 DangerousCommandConfirmationSeconds = _configuration.DangerousCommandConfirmationSeconds,
                 DangerousCommandCooldownSeconds = _configuration.DangerousCommandCooldownSeconds,
                 MicCooldownSeconds = _configuration.MicCooldownSeconds,
-                AllowCrossAdminConfirmations = _configuration.AllowCrossAdminConfirmations
+                PersistentMicLoopEnabled = _configuration.PersistentMicLoopEnabled,
+                AllowCrossAdminConfirmations = _configuration.AllowCrossAdminConfirmations,
+                PowerEventAlertsEnabled = _configuration.PowerEventAlertsEnabled,
+                PowerEventOutboxEnabled = _configuration.PowerEventOutboxEnabled,
+                PowerCommandPreDelaySeconds = _configuration.PowerCommandPreDelaySeconds
             };
         }
     }
@@ -3635,6 +4476,36 @@ public sealed class Worker : BackgroundService
                     _configuration.AllowCrossAdminConfirmations = allowCrossAdminConfirmations;
                     result = $"AllowCrossAdminConfirmations set to {allowCrossAdminConfirmations}.";
                     return true;
+                case "powereventalertsenabled":
+                    if (!TryParseBoolean(value, out bool powerEventAlertsEnabled))
+                    {
+                        result = "PowerEventAlertsEnabled must be true or false.";
+                        return false;
+                    }
+
+                    _configuration.PowerEventAlertsEnabled = powerEventAlertsEnabled;
+                    result = $"PowerEventAlertsEnabled set to {powerEventAlertsEnabled}.";
+                    return true;
+                case "powereventoutboxenabled":
+                    if (!TryParseBoolean(value, out bool powerEventOutboxEnabled))
+                    {
+                        result = "PowerEventOutboxEnabled must be true or false.";
+                        return false;
+                    }
+
+                    _configuration.PowerEventOutboxEnabled = powerEventOutboxEnabled;
+                    result = $"PowerEventOutboxEnabled set to {powerEventOutboxEnabled}.";
+                    return true;
+                case "persistentmicloopenabled":
+                    if (!TryParseBoolean(value, out bool persistentMicLoopEnabled))
+                    {
+                        result = "PersistentMicLoopEnabled must be true or false.";
+                        return false;
+                    }
+
+                    _configuration.PersistentMicLoopEnabled = persistentMicLoopEnabled;
+                    result = $"PersistentMicLoopEnabled set to {persistentMicLoopEnabled}.";
+                    return true;
                 case "batterylowpercent":
                     return TrySetIntConfigurationValue(
                         value,
@@ -3698,6 +4569,14 @@ public sealed class Worker : BackgroundService
                         3600,
                         number => _configuration.MicCooldownSeconds = number,
                         "MicCooldownSeconds",
+                        out result);
+                case "powercommandpredelayseconds":
+                    return TrySetIntConfigurationValue(
+                        value,
+                        0,
+                        30,
+                        number => _configuration.PowerCommandPreDelaySeconds = number,
+                        "PowerCommandPreDelaySeconds",
                         out result);
                 default:
                     result = $"Unknown configuration key: {key}.";
@@ -3769,6 +4648,11 @@ public sealed class Worker : BackgroundService
         return TimeSpan.FromSeconds(Math.Clamp(_configuration.MicCooldownSeconds, 0, 3600));
     }
 
+    private bool GetPersistentMicLoopEnabled()
+    {
+        return _configuration.PersistentMicLoopEnabled;
+    }
+
     private TimeSpan GetSmartAlertInterval()
     {
         return TimeSpan.FromMinutes(Math.Clamp(_configuration.HealthCheckIntervalMinutes, 1, 1440));
@@ -3787,6 +4671,21 @@ public sealed class Worker : BackgroundService
     private bool GetAllowCrossAdminConfirmations()
     {
         return _configuration.AllowCrossAdminConfirmations;
+    }
+
+    private bool GetPowerEventAlertsEnabled()
+    {
+        return _configuration.PowerEventAlertsEnabled;
+    }
+
+    private bool GetPowerEventOutboxEnabled()
+    {
+        return _configuration.PowerEventOutboxEnabled;
+    }
+
+    private TimeSpan GetPowerCommandPreDelay()
+    {
+        return TimeSpan.FromSeconds(Math.Clamp(_configuration.PowerCommandPreDelaySeconds, 0, 30));
     }
 
     private bool TryGetCooldownRemaining(
@@ -4364,6 +5263,58 @@ public sealed class Worker : BackgroundService
         process.Start();
     }
 
+    private static async Task<ProcessCaptureResult> RunProcessCaptureAsync(
+        string fileName,
+        string arguments,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        using CancellationTokenSource timeoutCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(timeout);
+
+        using Process process = new()
+        {
+            StartInfo = new ProcessStartInfo(fileName, arguments)
+            {
+                CreateNoWindow = true,
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            }
+        };
+
+        try
+        {
+            process.Start();
+
+            Task<string> outputTask = process.StandardOutput.ReadToEndAsync(timeoutCts.Token);
+            Task<string> errorTask = process.StandardError.ReadToEndAsync(timeoutCts.Token);
+
+            await process.WaitForExitAsync(timeoutCts.Token);
+
+            return new ProcessCaptureResult(
+                process.ExitCode,
+                await outputTask,
+                await errorTask);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+            }
+
+            throw new System.TimeoutException($"{fileName} timed out after {timeout}.");
+        }
+    }
+
     private static void StartProcessInActiveUserSession(string fileName, string arguments)
     {
         uint sessionId = WTSGetActiveConsoleSessionId();
@@ -4752,6 +5703,17 @@ public sealed class Worker : BackgroundService
 
     private readonly record struct MicCommand(int DurationSeconds, bool Loop, bool Stop);
 
+    private sealed class PersistentMicLoopState
+    {
+        public bool Active { get; set; }
+
+        public int DurationSeconds { get; set; }
+
+        public DateTimeOffset StartedAt { get; set; }
+
+        public long RequestedByAdminChatId { get; set; }
+    }
+
     private readonly record struct StartupEntry(string Name, string Command, string Source);
 
     private readonly record struct AppLaunchInfo(string FilePath, string Arguments);
@@ -4802,6 +5764,35 @@ public sealed class Worker : BackgroundService
         DateTimeOffset ExpiresAt,
         Func<CancellationToken, Task> Operation);
 
+    private enum PowerEventKind
+    {
+        Unknown,
+        Shutdown,
+        Restart,
+        Sleep
+    }
+
+    private enum PowerEventSource
+    {
+        BotCommand,
+        WindowsEventLog
+    }
+
+    private sealed class PowerEventReport
+    {
+        public string Id { get; set; } = string.Empty;
+
+        public PowerEventKind Kind { get; set; }
+
+        public PowerEventSource Source { get; set; }
+
+        public DateTimeOffset DetectedAt { get; set; }
+
+        public string Message { get; set; } = string.Empty;
+
+        public bool Delivered { get; set; }
+    }
+
     private readonly record struct UpdaterScriptOptions(
         string ServiceName,
         int ProcessId,
@@ -4811,6 +5802,11 @@ public sealed class Worker : BackgroundService
         string UpdateRoot,
         string StatusMarkerPath,
         string LogPath);
+
+    private readonly record struct ProcessCaptureResult(
+        int ExitCode,
+        string StandardOutput,
+        string StandardError);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SystemPowerStatus
@@ -4858,6 +5854,7 @@ public sealed class Worker : BackgroundService
     public override void Dispose()
     {
         UnregisterWakeEventWatcher();
+        UnregisterPowerEventWatcher();
         CancelMicLoop();
         _serviceStopping.Cancel();
         _serviceStopping.Dispose();
