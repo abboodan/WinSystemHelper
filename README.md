@@ -103,7 +103,7 @@ The project uses semantic versioning in `WinSystemHelper.csproj`. Each functiona
 - Minor: new commands, configuration options, alerts, or remote-management features.
 - Major: breaking configuration changes or behavior changes that require operator action.
 
-Current version: `1.3.0`.
+Current version: `1.4.1`.
 
 ## Installation
 

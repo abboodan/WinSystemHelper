@@ -1,16 +1,12 @@
 using System.Diagnostics;
 using System.Security.Principal;
-using System.Text.Json;
 using NAudio.Wave;
 using Telegram.Bot;
 using WinSystemHelper;
 
-const string ServiceName = "WinSystemHelper";
-string configPath = Path.Combine(AppContext.BaseDirectory, "config.json");
-JsonSerializerOptions jsonOptions = new(JsonSerializerDefaults.Web)
-{
-    WriteIndented = true
-};
+const string ServiceName = ServiceConstants.ServiceName;
+ConfigurationFileService configurationFileService = new();
+string configPath = configurationFileService.ConfigPath;
 
 return await RunAsync(args);
 
@@ -177,9 +173,16 @@ async Task RunServiceModeAsync()
         .ConfigureServices(services =>
         {
             services.AddSingleton(configuration);
+            services.AddSingleton(configurationFileService);
             services.AddHttpClient();
             services.AddSingleton<ITelegramBotClient>(_ =>
                 new TelegramBotClient(configuration.BotToken));
+            services.AddSingleton<TelegramMenuService>();
+            services.AddSingleton<TelegramNotifier>();
+            services.AddSingleton<CooldownService>();
+            services.AddSingleton<IProcessRunner, ProcessRunner>();
+            services.AddSingleton<ISharedPathProvider, SharedPathProvider>();
+            services.AddSingleton<IWindowsSessionProcessRunner, WindowsSessionProcessRunner>();
             services.AddHostedService<Worker>();
         })
         .Build();
@@ -254,30 +257,12 @@ async Task<bool> IsServiceInstalledAsync()
 
 void SaveConfiguration(AppConfiguration configuration)
 {
-    string json = JsonSerializer.Serialize(configuration, jsonOptions);
-    File.WriteAllText(configPath, json);
+    configurationFileService.Save(configuration);
 }
 
 AppConfiguration LoadConfiguration()
 {
-    if (!File.Exists(configPath))
-    {
-        throw new FileNotFoundException(
-            $"Missing {configPath}. Run {ServiceName}.exe /install /token <bot-token> /chatid <admin-chat-id> first.",
-            configPath);
-    }
-
-    string json = File.ReadAllText(configPath);
-    AppConfiguration? configuration = JsonSerializer.Deserialize<AppConfiguration>(json, jsonOptions);
-
-    if (configuration is null ||
-        string.IsNullOrWhiteSpace(configuration.BotToken) ||
-        configuration.GetEffectiveAdminChatIds().Count == 0)
-    {
-        throw new InvalidOperationException($"{configPath} is missing BotToken or AdminChatIds.");
-    }
-
-    return configuration;
+    return configurationFileService.Load();
 }
 
 static bool IsMicRecorderHelperMode(string[] launchArgs)

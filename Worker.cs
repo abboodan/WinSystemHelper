@@ -8,7 +8,6 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Cryptography;
-using System.Security.Principal;
 using System.ServiceProcess;
 using System.Text;
 using System.Text.Json;
@@ -45,11 +44,6 @@ public sealed class Worker : BackgroundService
     private const int TelegramUpdateLimit = 20;
     private const int DefaultMicRecordingSeconds = 10;
     private const int MaxMicRecordingSeconds = 60;
-    private const uint CreateNoWindow = 0x08000000;
-    private const uint CreateUnicodeEnvironment = 0x00000400;
-    private const uint ActiveConsoleSessionUnavailable = 0xFFFFFFFF;
-    private const uint WaitObject0 = 0x00000000;
-    private const uint WaitTimeout = 0x00000102;
     private const int TelegramBadRequestErrorCode = 400;
     private const int TelegramUnauthorizedErrorCode = 401;
     private const int TelegramForbiddenErrorCode = 403;
@@ -57,11 +51,11 @@ public sealed class Worker : BackgroundService
     private const uint AskNoExitCode = 2;
     private const byte BatteryLifePercentUnknown = 255;
     private const byte BatteryFlagNoSystemBattery = 128;
-    private const string ServiceName = "WinSystemHelper";
-    private const string ConfigFileName = "config.json";
+    private const string ServiceName = ServiceConstants.ServiceName;
+    private const string ConfigFileName = ServiceConstants.ConfigFileName;
     private const string ZipExtension = ".zip";
-    private const string UpdateStatusMarkerFileName = "WinSystemHelper-update-status.txt";
-    private const string MicLoopStateFileName = "mic-loop-state.json";
+    private const string UpdateStatusMarkerFileName = ServiceConstants.UpdateStatusMarkerFileName;
+    private const string MicLoopStateFileName = ServiceConstants.MicLoopStateFileName;
     private const string WakeEventLogName = "System";
     private const string WakeEventLogQuery =
         "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]";
@@ -69,44 +63,6 @@ public sealed class Worker : BackgroundService
     private const string PowerEventLogQuery =
         "*[System[(Provider[@Name='User32'] and EventID=1074) or (Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=42)]]";
     private const int MaxPowerEventOutboxFiles = 20;
-
-    [DllImport("kernel32.dll")]
-    private static extern uint WTSGetActiveConsoleSessionId();
-
-    [DllImport("wtsapi32.dll", SetLastError = true)]
-    private static extern bool WTSQueryUserToken(uint sessionId, out IntPtr token);
-
-    [DllImport("userenv.dll", SetLastError = true)]
-    private static extern bool CreateEnvironmentBlock(out IntPtr environment, IntPtr token, bool inherit);
-
-    [DllImport("userenv.dll", SetLastError = true)]
-    private static extern bool DestroyEnvironmentBlock(IntPtr environment);
-
-    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern bool CreateProcessAsUser(
-        IntPtr token,
-        string? applicationName,
-        string commandLine,
-        IntPtr processAttributes,
-        IntPtr threadAttributes,
-        bool inheritHandles,
-        uint creationFlags,
-        IntPtr environment,
-        string? currentDirectory,
-        ref StartupInfo startupInfo,
-        out ProcessInformation processInformation);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr handle);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetSystemPowerStatus(out SystemPowerStatus systemPowerStatus);
@@ -116,6 +72,13 @@ public sealed class Worker : BackgroundService
     private readonly ITelegramBotClient _botClient;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly IHostApplicationLifetime _hostLifetime;
+    private readonly TelegramMenuService _telegramMenuService;
+    private readonly TelegramNotifier _telegramNotifier;
+    private readonly CooldownService _cooldownService;
+    private readonly IProcessRunner _processRunner;
+    private readonly ISharedPathProvider _sharedPathProvider;
+    private readonly ConfigurationFileService _configurationFileService;
+    private readonly IWindowsSessionProcessRunner _windowsSessionProcessRunner;
     private readonly object _configurationSync = new();
     private long[] _adminChatIds;
     private readonly AsyncLocal<long?> _replyChatId = new();
@@ -123,7 +86,6 @@ public sealed class Worker : BackgroundService
     private readonly SemaphoreSlim _micRecordingLock = new(1, 1);
     private readonly SemaphoreSlim _screenshotLock = new(1, 1);
     private readonly SemaphoreSlim _updateLock = new(1, 1);
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _cooldowns = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<int, PendingConfirmation> _pendingConfirmations = new();
     private readonly object _publicIpSync = new();
     private readonly object _telemetrySync = new();
@@ -165,13 +127,27 @@ public sealed class Worker : BackgroundService
         AppConfiguration configuration,
         ITelegramBotClient botClient,
         IHttpClientFactory httpClientFactory,
-        IHostApplicationLifetime hostLifetime)
+        IHostApplicationLifetime hostLifetime,
+        TelegramMenuService telegramMenuService,
+        TelegramNotifier telegramNotifier,
+        CooldownService cooldownService,
+        IProcessRunner processRunner,
+        ISharedPathProvider sharedPathProvider,
+        ConfigurationFileService configurationFileService,
+        IWindowsSessionProcessRunner windowsSessionProcessRunner)
     {
         _logger = logger;
         _configuration = configuration;
         _botClient = botClient;
         _httpClientFactory = httpClientFactory;
         _hostLifetime = hostLifetime;
+        _telegramMenuService = telegramMenuService;
+        _telegramNotifier = telegramNotifier;
+        _cooldownService = cooldownService;
+        _processRunner = processRunner;
+        _sharedPathProvider = sharedPathProvider;
+        _configurationFileService = configurationFileService;
+        _windowsSessionProcessRunner = windowsSessionProcessRunner;
         _adminChatIds = NormalizeAdminChatIds(configuration.GetEffectiveAdminChatIds());
     }
 
@@ -209,7 +185,10 @@ public sealed class Worker : BackgroundService
         QueueBackgroundWork(SendStartupAlertAsync, "Startup alert failed.");
         QueueBackgroundWork(RestorePersistentMicLoopAsync, "Persistent mic loop restore failed.");
         QueueBackgroundWork(RunSmartAlertLoopAsync, "Smart alert loop failed.");
-        await RegisterTelegramMenuAsync(workerStopping.Token);
+        await _telegramMenuService.RegisterAsync(
+            GetAdminChatIdsSnapshot(),
+            TelegramSendTimeout,
+            workerStopping.Token);
 
         var offset = 0;
         var pollingFailureAttempt = 0;
@@ -1188,12 +1167,9 @@ public sealed class Worker : BackgroundService
         return $"{powerStatus.BatteryLifePercent}% | {status}";
     }
 
-    private static string GetActiveConsoleSessionStatus()
+    private string GetActiveConsoleSessionStatus()
     {
-        uint sessionId = WTSGetActiveConsoleSessionId();
-        return sessionId == ActiveConsoleSessionUnavailable
-            ? "Unavailable"
-            : $"Available (Session {sessionId})";
+        return _windowsSessionProcessRunner.GetActiveConsoleSessionStatus();
     }
 
     private string GetWakeWatcherStatus()
@@ -1478,7 +1454,7 @@ public sealed class Worker : BackgroundService
     {
         try
         {
-            StartProcessInActiveUserSession("rundll32.exe", "user32.dll,LockWorkStation");
+            _windowsSessionProcessRunner.StartProcess("rundll32.exe", "user32.dll,LockWorkStation");
             await SendTelegramMessageOnceAsync("🔒 Workstation locked.", cancellationToken);
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
@@ -1972,7 +1948,7 @@ public sealed class Worker : BackgroundService
                 }
             }
 
-            StartEncodedPowerShellInActiveUserSession(BuildLaunchApplicationScript(launchInfo.Value));
+            _windowsSessionProcessRunner.StartEncodedPowerShell(BuildLaunchApplicationScript(launchInfo.Value));
 
             string reply = wasRunning
                 ? $"🔄 {processName} was killed and restarted successfully in the active session."
@@ -2687,16 +2663,19 @@ public sealed class Worker : BackgroundService
 
         string? updateRoot = null;
         string? updaterScriptPath = null;
+        string? zipPath = null;
+        string updateStage = "initializing update";
         var updaterLaunched = false;
 
         try
         {
+            updateStage = "creating update staging folder";
             string updatesRoot = GetSharedTempDirectory("Updates");
             string updateId = Guid.NewGuid().ToString("N");
             updateRoot = Path.Combine(updatesRoot, updateId);
             string extractRoot = Path.Combine(updateRoot, "Extracted");
             string backupDirectory = Path.Combine(updateRoot, "Backup");
-            string zipPath = Path.Combine(updateRoot, "package.zip");
+            zipPath = Path.Combine(updateRoot, "package.zip");
             string logPath = Path.Combine(updateRoot, "update.log");
             string statusMarkerPath = GetUpdateStatusMarkerPath();
             updaterScriptPath = Path.Combine(updatesRoot, $"WinSystemHelper-update-{updateId}.ps1");
@@ -2714,6 +2693,7 @@ public sealed class Worker : BackgroundService
                     return;
                 }
 
+                updateStage = $"downloading Telegram document '{document.FileName ?? document.FileId}'";
                 await DownloadTelegramUpdatePackageAsync(document, zipPath, cancellationToken);
             }
             else
@@ -2733,14 +2713,19 @@ public sealed class Worker : BackgroundService
                     return;
                 }
 
+                updateStage = $"downloading update URL '{updateUri}'";
                 await DownloadUrlUpdatePackageAsync(updateUri!, zipPath, cancellationToken);
             }
 
+            updateStage = "extracting update package";
             await ExtractUpdatePackageAsync(zipPath, extractRoot, cancellationToken);
 
+            updateStage = "resolving update payload root";
             string payloadRoot = ResolveUpdatePayloadRoot(extractRoot);
+            updateStage = $"validating update payload '{payloadRoot}'";
             ValidateUpdatePayloadRoot(payloadRoot);
 
+            updateStage = "writing updater script";
             UpdaterScriptOptions scriptOptions = new(
                 ServiceName,
                 Environment.ProcessId,
@@ -2753,10 +2738,12 @@ public sealed class Worker : BackgroundService
 
             await WriteUpdaterScriptAsync(updaterScriptPath, scriptOptions, cancellationToken);
 
+            updateStage = "notifying Telegram before restart";
             await SendTelegramMessageOnceAsync(
                 "🔄 Update received. Service is restarting to apply updates...",
                 cancellationToken);
 
+            updateStage = "launching updater script";
             LaunchUpdaterScript(updaterScriptPath);
             updaterLaunched = true;
             _hostLifetime.StopApplication();
@@ -2768,7 +2755,11 @@ public sealed class Worker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "OTA update command failed.");
-            await SendTelegramMessageOnceAsync($"⚠️ OTA update failed: {ex.Message}", CancellationToken.None);
+            string diagnosticPath = WriteOtaFailureDiagnostic(updateStage, ex, updateRoot, zipPath);
+            await SendTelegramMessageOnceAsync(
+                BuildOtaFailureTelegramMessage(updateStage, ex, diagnosticPath),
+                CancellationToken.None);
+            return;
         }
         finally
         {
@@ -2848,9 +2839,112 @@ public sealed class Worker : BackgroundService
         return null;
     }
 
-    private static async Task<string?> GetConfiguredServiceExecutablePathAsync(CancellationToken cancellationToken)
+    private string BuildOtaFailureTelegramMessage(
+        string stage,
+        Exception exception,
+        string diagnosticPath)
     {
-        ProcessCaptureResult result = await RunProcessCaptureAsync(
+        string reason = GetUsefulExceptionMessage(exception);
+
+        string message = string.Join(
+            Environment.NewLine,
+            "⚠️ OTA update failed.",
+            $"Stage: {stage}",
+            $"Reason: {reason}",
+            $"Type: {exception.GetType().FullName}",
+            $"Diagnostics: {diagnosticPath}");
+
+        return TruncateForTelegram(message, 3900);
+    }
+
+    private string WriteOtaFailureDiagnostic(
+        string stage,
+        Exception exception,
+        string? updateRoot,
+        string? zipPath)
+    {
+        try
+        {
+            string diagnosticPath = Path.Combine(
+                GetSharedTempDirectory("Updates"),
+                "WinSystemHelper-last-ota-failure.txt");
+
+            string? zipDetails = null;
+            if (!string.IsNullOrWhiteSpace(zipPath))
+            {
+                FileInfo zipFile = new(zipPath);
+                zipDetails = zipFile.Exists
+                    ? $"{zipFile.FullName} ({zipFile.Length} bytes)"
+                    : $"{zipPath} (missing)";
+            }
+
+            string report = string.Join(
+                Environment.NewLine,
+                $"Timestamp: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}",
+                $"Stage: {stage}",
+                $"ExceptionType: {exception.GetType().FullName}",
+                $"Reason: {GetUsefulExceptionMessage(exception)}",
+                $"HResult: 0x{exception.HResult:X8}",
+                $"UpdateRoot: {updateRoot ?? "Unavailable"}",
+                $"ZipPath: {zipDetails ?? "Unavailable"}",
+                string.Empty,
+                "Exception:",
+                exception.ToString());
+
+            File.WriteAllText(diagnosticPath, report, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            return diagnosticPath;
+        }
+        catch (Exception diagnosticException)
+        {
+            _logger.LogWarning(diagnosticException, "Failed to write OTA failure diagnostic report.");
+            return $"Unavailable ({diagnosticException.GetType().Name}: {GetUsefulExceptionMessage(diagnosticException)})";
+        }
+    }
+
+    private static string GetUsefulExceptionMessage(Exception exception)
+    {
+        List<string> messages = [];
+        Exception? current = exception;
+
+        while (current is not null)
+        {
+            if (!string.IsNullOrWhiteSpace(current.Message))
+            {
+                messages.Add(current.Message.Trim());
+            }
+
+            current = current.InnerException;
+        }
+
+        if (exception is AggregateException aggregateException)
+        {
+            foreach (Exception innerException in aggregateException.Flatten().InnerExceptions)
+            {
+                if (!string.IsNullOrWhiteSpace(innerException.Message))
+                {
+                    messages.Add(innerException.Message.Trim());
+                }
+            }
+        }
+
+        string message = string.Join(" | ", messages.Distinct(StringComparer.Ordinal));
+        if (!string.IsNullOrWhiteSpace(message))
+        {
+            return TruncateForTelegram(message, 1200);
+        }
+
+        string exceptionText = exception.ToString();
+        if (!string.IsNullOrWhiteSpace(exceptionText))
+        {
+            return TruncateForTelegram(exceptionText.Split(Environment.NewLine)[0], 1200);
+        }
+
+        return $"{exception.GetType().FullName} was thrown without a message.";
+    }
+
+    private async Task<string?> GetConfiguredServiceExecutablePathAsync(CancellationToken cancellationToken)
+    {
+        ProcessCaptureResult result = await _processRunner.CaptureAsync(
             "sc.exe",
             $"qc {ServiceName}",
             TimeSpan.FromSeconds(10),
@@ -2887,7 +2981,7 @@ public sealed class Worker : BackgroundService
         return null;
     }
 
-    private static async Task<bool> HasDotNet8RuntimeAsync(CancellationToken cancellationToken)
+    private async Task<bool> HasDotNet8RuntimeAsync(CancellationToken cancellationToken)
     {
         if (HasDotNet8RuntimeInRegistry())
         {
@@ -2896,7 +2990,7 @@ public sealed class Worker : BackgroundService
 
         try
         {
-            ProcessCaptureResult result = await RunProcessCaptureAsync(
+            ProcessCaptureResult result = await _processRunner.CaptureAsync(
                 "dotnet.exe",
                 "--list-runtimes",
                 TimeSpan.FromSeconds(10),
@@ -2991,6 +3085,11 @@ public sealed class Worker : BackgroundService
             CreateTimeoutTokenSource(cancellationToken, UpdateDownloadTimeout);
 
         TGFile telegramFile = await _botClient.GetFile(document.FileId, timeout.Token);
+        if (string.IsNullOrWhiteSpace(telegramFile.FilePath))
+        {
+            throw new InvalidOperationException(
+                $"Telegram returned no downloadable file path for '{document.FileName ?? document.FileId}'.");
+        }
 
         await using FileStream destination = File.Create(zipPath);
         await _botClient.DownloadFile(telegramFile, destination, timeout.Token);
@@ -3172,7 +3271,7 @@ public sealed class Worker : BackgroundService
         return commandText[(separatorIndex + 1)..].Trim();
     }
 
-    private static void ShowScreenMessage(string message)
+    private void ShowScreenMessage(string message)
     {
         string script = BuildMessageBoxScript(
             message,
@@ -3180,7 +3279,7 @@ public sealed class Worker : BackgroundService
             icon: "Warning",
             includeAskExitCodes: false);
 
-        StartEncodedPowerShellInActiveUserSession(script);
+        _windowsSessionProcessRunner.StartEncodedPowerShell(script);
     }
 
     private async Task AskActiveUserAsync(string question, CancellationToken cancellationToken)
@@ -3193,7 +3292,7 @@ public sealed class Worker : BackgroundService
                 icon: "Question",
                 includeAskExitCodes: true);
 
-            uint exitCode = await StartEncodedPowerShellInActiveUserSessionAndWaitAsync(
+            uint exitCode = await _windowsSessionProcessRunner.StartEncodedPowerShellAndWaitAsync(
                 script,
                 AskPromptTimeout,
                 cancellationToken);
@@ -3233,7 +3332,7 @@ public sealed class Worker : BackgroundService
 
             string script = BuildInputBoxScript(prompt, tempFile);
 
-            _ = await StartEncodedPowerShellInActiveUserSessionAndWaitAsync(
+            _ = await _windowsSessionProcessRunner.StartEncodedPowerShellAndWaitAsync(
                 script,
                 TextPromptTimeout,
                 cancellationToken);
@@ -3269,7 +3368,7 @@ public sealed class Worker : BackgroundService
     {
         try
         {
-            StartEncodedPowerShellInActiveUserSession(BuildSpeakScript(message));
+            _windowsSessionProcessRunner.StartEncodedPowerShell(BuildSpeakScript(message));
             await SendTelegramMessageOnceAsync("🗣️ Audio message played.", cancellationToken);
         }
         catch (Exception ex) when (ex is Win32Exception or InvalidOperationException)
@@ -3291,7 +3390,7 @@ public sealed class Worker : BackgroundService
 
             string script = BuildScreenshotScript(tempFile);
 
-            uint exitCode = await StartEncodedPowerShellInActiveUserSessionAndWaitAsync(
+            uint exitCode = await _windowsSessionProcessRunner.StartEncodedPowerShellAndWaitAsync(
                 script,
                 ScreenshotTimeout,
                 cancellationToken);
@@ -3667,7 +3766,7 @@ public sealed class Worker : BackgroundService
         DeleteTempFile(GetPersistentMicLoopStatePath());
     }
 
-    private static string GetPersistentMicLoopStatePath()
+    private string GetPersistentMicLoopStatePath()
     {
         return Path.Combine(GetSharedTempDirectory("Audio"), MicLoopStateFileName);
     }
@@ -3813,47 +3912,20 @@ public sealed class Worker : BackgroundService
         return new MicCommand(durationSeconds, loop, Stop: false);
     }
 
-    private static void TriggerOvertRecordingWarnings()
+    private void TriggerOvertRecordingWarnings()
     {
-        StartProcessInActiveUserSession(
+        _windowsSessionProcessRunner.StartProcess(
             "msg.exe",
             "* \"🚨 SECURITY BREACH: Audio recording is now ACTIVE and being transmitted to the administrator.\"");
 
-        StartProcessInActiveUserSession(
-            GetWindowsPowerShellPath(),
+        _windowsSessionProcessRunner.StartWindowsPowerShell(
             "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"(New-Object -ComObject SAPI.SpVoice).Speak('Security alert. Audio recording activated.')\"");
     }
 
-    private static void TriggerPowerShellBeep()
+    private void TriggerPowerShellBeep()
     {
-        StartProcessInActiveUserSession(
-            GetWindowsPowerShellPath(),
+        _windowsSessionProcessRunner.StartWindowsPowerShell(
             "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"[console]::beep(3000, 3000)\"");
-    }
-
-    private static void StartEncodedPowerShellInActiveUserSession(string script)
-    {
-        StartProcessInActiveUserSession(
-            GetWindowsPowerShellPath(),
-            BuildEncodedPowerShellArguments(script));
-    }
-
-    private static Task<uint> StartEncodedPowerShellInActiveUserSessionAndWaitAsync(
-        string script,
-        TimeSpan timeout,
-        CancellationToken cancellationToken)
-    {
-        return StartProcessInActiveUserSessionAndWaitAsync(
-            GetWindowsPowerShellPath(),
-            BuildEncodedPowerShellArguments(script),
-            timeout,
-            cancellationToken);
-    }
-
-    private static string BuildEncodedPowerShellArguments(string script)
-    {
-        string base64Script = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
-        return $"-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {base64Script}";
     }
 
     private static string BuildMessageBoxScript(
@@ -4243,32 +4315,9 @@ public sealed class Worker : BackgroundService
         }
     }
 
-    private static string? TryGetActiveUserSid()
+    private string? TryGetActiveUserSid()
     {
-        uint sessionId = WTSGetActiveConsoleSessionId();
-        if (sessionId == ActiveConsoleSessionUnavailable)
-        {
-            return null;
-        }
-
-        if (!WTSQueryUserToken(sessionId, out IntPtr userToken))
-        {
-            return null;
-        }
-
-        try
-        {
-            using WindowsIdentity identity = new(userToken);
-            return identity.User?.Value;
-        }
-        catch
-        {
-            return null;
-        }
-        finally
-        {
-            CloseHandle(userToken);
-        }
+        return _windowsSessionProcessRunner.TryGetActiveUserSid();
     }
 
     private static bool IsZipFileName(string? fileName)
@@ -4344,7 +4393,7 @@ public sealed class Worker : BackgroundService
         return $"\"{value.Replace("\"", "\\\"", StringComparison.Ordinal)}\"";
     }
 
-    private static string GetUpdateStatusMarkerPath()
+    private string GetUpdateStatusMarkerPath()
     {
         return Path.Combine(GetSharedTempDirectory("Updates"), UpdateStatusMarkerFileName);
     }
@@ -4417,12 +4466,7 @@ public sealed class Worker : BackgroundService
     {
         lock (_configurationSync)
         {
-            string configPath = GetConfigurationPath();
-            string tempPath = $"{configPath}.{Guid.NewGuid():N}.tmp";
-            string json = JsonSerializer.Serialize(_configuration, ConfigurationJsonOptions);
-
-            File.WriteAllText(tempPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-            File.Move(tempPath, configPath, overwrite: true);
+            _configurationFileService.SaveAtomic(_configuration);
         }
     }
 
@@ -4441,11 +4485,6 @@ public sealed class Worker : BackgroundService
                 cancellationToken);
             return false;
         }
-    }
-
-    private static string GetConfigurationPath()
-    {
-        return Path.Combine(AppContext.BaseDirectory, ConfigFileName);
     }
 
     private bool TrySetConfigurationValue(string key, string value, out string? result)
@@ -4693,31 +4732,12 @@ public sealed class Worker : BackgroundService
         TimeSpan cooldown,
         out TimeSpan remaining)
     {
-        remaining = TimeSpan.Zero;
-        if (cooldown <= TimeSpan.Zero)
-        {
-            return false;
-        }
-
-        if (!_cooldowns.TryGetValue(key, out DateTimeOffset lastRunAt))
-        {
-            return false;
-        }
-
-        TimeSpan elapsed = DateTimeOffset.Now - lastRunAt;
-        if (elapsed >= cooldown)
-        {
-            _cooldowns.TryRemove(key, out _);
-            return false;
-        }
-
-        remaining = cooldown - elapsed;
-        return true;
+        return _cooldownService.TryGetRemaining(key, cooldown, out remaining);
     }
 
     private void MarkCooldown(string key)
     {
-        _cooldowns[key] = DateTimeOffset.Now;
+        _cooldownService.Mark(key);
     }
 
     private static string FormatDurationForHumans(TimeSpan duration)
@@ -4795,7 +4815,7 @@ public sealed class Worker : BackgroundService
         }
     }
 
-    private static async Task RunMicRecorderHelperAsync(
+    private async Task RunMicRecorderHelperAsync(
         string outputPath,
         int durationSeconds,
         CancellationToken cancellationToken)
@@ -4806,7 +4826,7 @@ public sealed class Worker : BackgroundService
             $"/seconds {durationSeconds}",
             $"/out \"{outputPath}\"");
 
-        uint exitCode = await StartProcessInActiveUserSessionAndWaitAsync(
+        uint exitCode = await _windowsSessionProcessRunner.StartProcessAndWaitAsync(
             GetCurrentExecutablePath(),
             commandLine,
             TimeSpan.FromSeconds(durationSeconds + 15),
@@ -4824,15 +4844,9 @@ public sealed class Worker : BackgroundService
         }
     }
 
-    private static string GetSharedTempDirectory(string purpose)
+    private string GetSharedTempDirectory(string purpose)
     {
-        string directory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonDocuments),
-            "WinSystemHelper",
-            purpose);
-
-        Directory.CreateDirectory(directory);
-        return directory;
+        return _sharedPathProvider.GetSharedTempDirectory(purpose);
     }
 
     private CancellationTokenSource? CancelMicLoop()
@@ -5170,85 +5184,6 @@ public sealed class Worker : BackgroundService
         return true;
     }
 
-    private async Task RegisterTelegramMenuAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            BotCommand[] commands = BuildTelegramCommands();
-
-            foreach (long adminChatId in GetAdminChatIdsSnapshot())
-            {
-                try
-                {
-                    using CancellationTokenSource timeout =
-                        CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
-
-                    await _botClient.SetMyCommands(
-                        commands,
-                        scope: new BotCommandScopeChat { ChatId = adminChatId },
-                        cancellationToken: timeout.Token);
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(
-                        ex,
-                        "Failed to register Telegram command menu for admin chat {AdminChatId}.",
-                        adminChatId);
-                }
-            }
-
-            _logger.LogInformation("Telegram command menu registered.");
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to register Telegram command menu.");
-        }
-    }
-
-    private static BotCommand[] BuildTelegramCommands()
-    {
-        return
-        [
-            new BotCommand { Command = "status", Description = "Show service status" },
-            new BotCommand { Command = "healthcheck", Description = "Show fast healthcheck" },
-            new BotCommand { Command = "version", Description = "Show installed version" },
-            new BotCommand { Command = "confirm", Description = "Confirm pending command" },
-            new BotCommand { Command = "cancel", Description = "Cancel pending command" },
-            new BotCommand { Command = "lock", Description = "Lock the workstation" },
-            new BotCommand { Command = "shutdown", Description = "Request shutdown" },
-            new BotCommand { Command = "restart", Description = "Request restart" },
-            new BotCommand { Command = "sleep", Description = "Request sleep" },
-            new BotCommand { Command = "ip", Description = "Show public IP address" },
-            new BotCommand { Command = "net", Description = "Show local network report" },
-            new BotCommand { Command = "alarm", Description = "Play system alert sound" },
-            new BotCommand { Command = "mic", Description = "Trigger overt alarm audio recording" },
-            new BotCommand { Command = "msg", Description = "Show a screen message" },
-            new BotCommand { Command = "ask", Description = "Ask a Yes/No question" },
-            new BotCommand { Command = "prompt", Description = "Request text input" },
-            new BotCommand { Command = "speak", Description = "Speak a message" },
-            new BotCommand { Command = "screen", Description = "Capture the screen" },
-            new BotCommand { Command = "tasks", Description = "Show top processes" },
-            new BotCommand { Command = "kill", Description = "Terminate a process" },
-            new BotCommand { Command = "startup", Description = "List startup applications" },
-            new BotCommand { Command = "restartapp", Description = "Restart an application" },
-            new BotCommand { Command = "services", Description = "List Windows services" },
-            new BotCommand { Command = "service", Description = "Manage a Windows service" },
-            new BotCommand { Command = "config", Description = "Manage runtime configuration" },
-            new BotCommand { Command = "update", Description = "Apply an OTA update" },
-            new BotCommand { Command = "help", Description = "Show available commands" },
-            new BotCommand { Command = "stop", Description = "Stop the service" },
-            new BotCommand { Command = "uninstall", Description = "Stop and delete the service" }
-        ];
-    }
-
     private static void StartDetachedProcess(string fileName, string arguments)
     {
         using Process process = new()
@@ -5261,212 +5196,6 @@ public sealed class Worker : BackgroundService
         };
 
         process.Start();
-    }
-
-    private static async Task<ProcessCaptureResult> RunProcessCaptureAsync(
-        string fileName,
-        string arguments,
-        TimeSpan timeout,
-        CancellationToken cancellationToken)
-    {
-        using CancellationTokenSource timeoutCts =
-            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(timeout);
-
-        using Process process = new()
-        {
-            StartInfo = new ProcessStartInfo(fileName, arguments)
-            {
-                CreateNoWindow = true,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true,
-                UseShellExecute = false
-            }
-        };
-
-        try
-        {
-            process.Start();
-
-            Task<string> outputTask = process.StandardOutput.ReadToEndAsync(timeoutCts.Token);
-            Task<string> errorTask = process.StandardError.ReadToEndAsync(timeoutCts.Token);
-
-            await process.WaitForExitAsync(timeoutCts.Token);
-
-            return new ProcessCaptureResult(
-                process.ExitCode,
-                await outputTask,
-                await errorTask);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                if (!process.HasExited)
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-            }
-            catch
-            {
-            }
-
-            throw new System.TimeoutException($"{fileName} timed out after {timeout}.");
-        }
-    }
-
-    private static void StartProcessInActiveUserSession(string fileName, string arguments)
-    {
-        uint sessionId = WTSGetActiveConsoleSessionId();
-        if (sessionId == ActiveConsoleSessionUnavailable)
-        {
-            throw new InvalidOperationException("No active console user session is available.");
-        }
-
-        if (!WTSQueryUserToken(sessionId, out IntPtr userToken))
-        {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to query the active user token.");
-        }
-
-        IntPtr environment = IntPtr.Zero;
-        try
-        {
-            uint creationFlags = CreateNoWindow;
-            if (CreateEnvironmentBlock(out environment, userToken, inherit: false))
-            {
-                creationFlags |= CreateUnicodeEnvironment;
-            }
-
-            string executablePath = Path.IsPathRooted(fileName)
-                ? fileName
-                : Path.Combine(Environment.SystemDirectory, fileName);
-
-            string commandLine = $"\"{executablePath}\" {arguments}";
-            StartupInfo startupInfo = new()
-            {
-                cb = Marshal.SizeOf<StartupInfo>(),
-                lpDesktop = "winsta0\\default"
-            };
-
-            if (!CreateProcessAsUser(
-                    userToken,
-                    applicationName: null,
-                    commandLine: commandLine,
-                    processAttributes: IntPtr.Zero,
-                    threadAttributes: IntPtr.Zero,
-                    inheritHandles: false,
-                    creationFlags: creationFlags,
-                    environment: environment,
-                    currentDirectory: Environment.SystemDirectory,
-                    startupInfo: ref startupInfo,
-                    processInformation: out ProcessInformation processInformation))
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to start process in the active user session.");
-            }
-
-            CloseHandleIfNeeded(processInformation.hThread);
-            CloseHandleIfNeeded(processInformation.hProcess);
-        }
-        finally
-        {
-            if (environment != IntPtr.Zero)
-            {
-                DestroyEnvironmentBlock(environment);
-            }
-
-            CloseHandleIfNeeded(userToken);
-        }
-    }
-
-    private static async Task<uint> StartProcessInActiveUserSessionAndWaitAsync(
-        string fileName,
-        string arguments,
-        TimeSpan timeout,
-        CancellationToken cancellationToken)
-    {
-        uint sessionId = WTSGetActiveConsoleSessionId();
-        if (sessionId == ActiveConsoleSessionUnavailable)
-        {
-            throw new InvalidOperationException("No active console user session is available.");
-        }
-
-        if (!WTSQueryUserToken(sessionId, out IntPtr userToken))
-        {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to query the active user token.");
-        }
-
-        IntPtr environment = IntPtr.Zero;
-        ProcessInformation processInformation = default;
-
-        try
-        {
-            uint creationFlags = CreateNoWindow;
-            if (CreateEnvironmentBlock(out environment, userToken, inherit: false))
-            {
-                creationFlags |= CreateUnicodeEnvironment;
-            }
-
-            string executablePath = Path.IsPathRooted(fileName)
-                ? fileName
-                : Path.Combine(Environment.SystemDirectory, fileName);
-
-            string commandLine = $"\"{executablePath}\" {arguments}";
-            StartupInfo startupInfo = new()
-            {
-                cb = Marshal.SizeOf<StartupInfo>(),
-                lpDesktop = "winsta0\\default"
-            };
-
-            if (!CreateProcessAsUser(
-                    userToken,
-                    applicationName: null,
-                    commandLine: commandLine,
-                    processAttributes: IntPtr.Zero,
-                    threadAttributes: IntPtr.Zero,
-                    inheritHandles: false,
-                    creationFlags: creationFlags,
-                    environment: environment,
-                    currentDirectory: Path.GetDirectoryName(executablePath),
-                    startupInfo: ref startupInfo,
-                    processInformation: out processInformation))
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to start process in the active user session.");
-            }
-
-            uint waitResult = await Task.Run(
-                () => WaitForSingleObject(processInformation.hProcess, (uint)timeout.TotalMilliseconds),
-                cancellationToken);
-
-            if (waitResult == WaitTimeout)
-            {
-                TerminateProcessIfNeeded(processInformation.hProcess);
-                throw new System.TimeoutException("Active user process timed out.");
-            }
-
-            if (waitResult != WaitObject0)
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "Failed while waiting for recorder helper.");
-            }
-
-            if (!GetExitCodeProcess(processInformation.hProcess, out uint exitCode))
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to read recorder helper exit code.");
-            }
-
-            return exitCode;
-        }
-        finally
-        {
-            CloseHandleIfNeeded(processInformation.hThread);
-            CloseHandleIfNeeded(processInformation.hProcess);
-
-            if (environment != IntPtr.Zero)
-            {
-                DestroyEnvironmentBlock(environment);
-            }
-
-            CloseHandleIfNeeded(userToken);
-        }
     }
 
     private static string GetWindowsPowerShellPath()
@@ -5490,22 +5219,6 @@ public sealed class Worker : BackgroundService
         return Environment.ProcessPath ??
             Process.GetCurrentProcess().MainModule?.FileName ??
             throw new InvalidOperationException("Unable to resolve executable path.");
-    }
-
-    private static void CloseHandleIfNeeded(IntPtr handle)
-    {
-        if (handle != IntPtr.Zero)
-        {
-            _ = CloseHandle(handle);
-        }
-    }
-
-    private static void TerminateProcessIfNeeded(IntPtr process)
-    {
-        if (process != IntPtr.Zero)
-        {
-            _ = TerminateProcess(process, exitCode: 1);
-        }
     }
 
     private void QueueBackgroundWork(
@@ -5624,49 +5337,22 @@ public sealed class Worker : BackgroundService
         string text,
         CancellationToken cancellationToken)
     {
-        using CancellationTokenSource timeout =
-            CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
-
-        await _botClient.SendMessage(
-            chatId: GetReplyChatId(),
-            text: text,
-            cancellationToken: timeout.Token);
+        await _telegramNotifier.SendMessageAsync(
+            GetReplyChatId(),
+            text,
+            TelegramSendTimeout,
+            cancellationToken);
     }
 
     private async Task<bool> SendTelegramBroadcastOnceAsync(
         string text,
         CancellationToken cancellationToken)
     {
-        var anyDelivered = false;
-
-        foreach (long adminChatId in GetAdminChatIdsSnapshot())
-        {
-            try
-            {
-                using CancellationTokenSource timeout =
-                    CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
-
-                await _botClient.SendMessage(
-                    chatId: adminChatId,
-                    text: text,
-                    cancellationToken: timeout.Token);
-
-                anyDelivered = true;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(
-                    ex,
-                    "Telegram broadcast delivery failed for admin chat {AdminChatId}.",
-                    adminChatId);
-            }
-        }
-
-        return anyDelivered;
+        return await _telegramNotifier.BroadcastAsync(
+            GetAdminChatIdsSnapshot(),
+            text,
+            TelegramSendTimeout,
+            cancellationToken);
     }
 
     private long GetReplyChatId()
@@ -5699,156 +5385,6 @@ public sealed class Worker : BackgroundService
         double delayMilliseconds = initialDelay.TotalMilliseconds * Math.Pow(2, exponent);
 
         return TimeSpan.FromMilliseconds(Math.Min(delayMilliseconds, maxDelay.TotalMilliseconds));
-    }
-
-    private readonly record struct MicCommand(int DurationSeconds, bool Loop, bool Stop);
-
-    private sealed class PersistentMicLoopState
-    {
-        public bool Active { get; set; }
-
-        public int DurationSeconds { get; set; }
-
-        public DateTimeOffset StartedAt { get; set; }
-
-        public long RequestedByAdminChatId { get; set; }
-    }
-
-    private readonly record struct StartupEntry(string Name, string Command, string Source);
-
-    private readonly record struct AppLaunchInfo(string FilePath, string Arguments);
-
-    private readonly record struct TelemetrySnapshot(
-        DateTimeOffset? LastPollingSuccessAt,
-        DateTimeOffset? LastPollingFailureAt,
-        DateTimeOffset? LastWakeAlertAt,
-        DateTimeOffset? LastStartupAlertAt,
-        DateTimeOffset? LastSmartAlertAt,
-        string? LastError,
-        int PollingFailureStreak);
-
-    private readonly record struct PublicIpSnapshot(
-        string? PublicIp,
-        DateTimeOffset? FetchedAt,
-        DateTimeOffset? NextAttemptAt,
-        int FailureCount);
-
-    private readonly record struct PublicIpLookupResult(
-        bool Success,
-        string? PublicIp,
-        bool FromCache,
-        string? ErrorMessage,
-        string? StalePublicIp)
-    {
-        public static PublicIpLookupResult Cached(string publicIp, DateTimeOffset fetchedAt)
-        {
-            return new PublicIpLookupResult(true, publicIp, FromCache: true, ErrorMessage: null, StalePublicIp: null);
-        }
-
-        public static PublicIpLookupResult Fresh(string publicIp)
-        {
-            return new PublicIpLookupResult(true, publicIp, FromCache: false, ErrorMessage: null, StalePublicIp: null);
-        }
-
-        public static PublicIpLookupResult Failed(string errorMessage, string? stalePublicIp)
-        {
-            return new PublicIpLookupResult(false, null, FromCache: false, errorMessage, stalePublicIp);
-        }
-    }
-
-    private readonly record struct PendingConfirmation(
-        int Id,
-        string CommandKey,
-        string Description,
-        long RequesterChatId,
-        DateTimeOffset ExpiresAt,
-        Func<CancellationToken, Task> Operation);
-
-    private enum PowerEventKind
-    {
-        Unknown,
-        Shutdown,
-        Restart,
-        Sleep
-    }
-
-    private enum PowerEventSource
-    {
-        BotCommand,
-        WindowsEventLog
-    }
-
-    private sealed class PowerEventReport
-    {
-        public string Id { get; set; } = string.Empty;
-
-        public PowerEventKind Kind { get; set; }
-
-        public PowerEventSource Source { get; set; }
-
-        public DateTimeOffset DetectedAt { get; set; }
-
-        public string Message { get; set; } = string.Empty;
-
-        public bool Delivered { get; set; }
-    }
-
-    private readonly record struct UpdaterScriptOptions(
-        string ServiceName,
-        int ProcessId,
-        string PayloadRoot,
-        string TargetDirectory,
-        string BackupDirectory,
-        string UpdateRoot,
-        string StatusMarkerPath,
-        string LogPath);
-
-    private readonly record struct ProcessCaptureResult(
-        int ExitCode,
-        string StandardOutput,
-        string StandardError);
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct SystemPowerStatus
-    {
-        public byte ACLineStatus;
-        public byte BatteryFlag;
-        public byte BatteryLifePercent;
-        public byte SystemStatusFlag;
-        public int BatteryLifeTime;
-        public int BatteryFullLifeTime;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct StartupInfo
-    {
-        public int cb;
-        public string? lpReserved;
-        public string? lpDesktop;
-        public string? lpTitle;
-        public int dwX;
-        public int dwY;
-        public int dwXSize;
-        public int dwYSize;
-        public int dwXCountChars;
-        public int dwYCountChars;
-        public int dwFillAttribute;
-        public int dwFlags;
-        public short wShowWindow;
-        public short cbReserved2;
-        public IntPtr lpReserved2;
-        public IntPtr hStdInput;
-        public IntPtr hStdOutput;
-        public IntPtr hStdError;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ProcessInformation
-    {
-        public IntPtr hProcess;
-        public IntPtr hThread;
-        public int dwProcessId;
-        public int dwThreadId;
     }
 
     public override void Dispose()
