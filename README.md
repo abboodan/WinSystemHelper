@@ -32,6 +32,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/status` | Shows the full low-overhead system, runtime, service, battery, and wake watcher dashboard. |
 | `/healthcheck` | Shows a fast health summary with cached state and recent failures. |
 | `/version` | Shows the installed WinSystemHelper version. |
+| `/ping` | Returns a lightweight online response with machine name and timestamp. |
 | `/confirm [Id]` | Confirms a pending dangerous command. |
 | `/cancel [Id]` | Cancels a pending dangerous command. |
 | `/lock` | Locks the active Windows workstation. |
@@ -50,6 +51,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/prompt [text]` | Forces a text response from the active user and returns it to Telegram. |
 | `/speak [text]` | Speaks a message through the active user session. |
 | `/screen` | Captures the active user's primary screen and returns the image. |
+| `/cam` | Shows overt local warnings, captures one camera photo if available, and returns it. |
 | `/tasks` | Lists the top memory-consuming processes. |
 | `/kill [ProcessName]` | Terminates matching process instances by name. |
 | `/startup` | Lists startup applications from machine and active-user registry run keys. |
@@ -103,7 +105,7 @@ The project uses semantic versioning in `WinSystemHelper.csproj`. Each functiona
 - Minor: new commands, configuration options, alerts, or remote-management features.
 - Major: breaking configuration changes or behavior changes that require operator action.
 
-Current version: `1.4.1`.
+Current version: `1.5.3`.
 
 ## Installation
 

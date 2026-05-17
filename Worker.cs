@@ -16,6 +16,7 @@ using Telegram.Bot.Exceptions;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
 
 namespace WinSystemHelper;
 
@@ -32,6 +33,7 @@ public sealed class Worker : BackgroundService
     private static readonly TimeSpan AskPromptTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan TextPromptTimeout = TimeSpan.FromSeconds(120);
     private static readonly TimeSpan ScreenshotTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan CameraCaptureTimeout = TimeSpan.FromSeconds(25);
     private static readonly TimeSpan UpdateDownloadTimeout = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan PublicIpRefreshTimeout = TimeSpan.FromSeconds(3);
     private static readonly Uri TelegramApiBaseUri = new("https://api.telegram.org");
@@ -85,6 +87,7 @@ public sealed class Worker : BackgroundService
     private readonly SemaphoreSlim _resumeNotificationLock = new(1, 1);
     private readonly SemaphoreSlim _micRecordingLock = new(1, 1);
     private readonly SemaphoreSlim _screenshotLock = new(1, 1);
+    private readonly SemaphoreSlim _cameraLock = new(1, 1);
     private readonly SemaphoreSlim _updateLock = new(1, 1);
     private readonly ConcurrentDictionary<int, PendingConfirmation> _pendingConfirmations = new();
     private readonly object _publicIpSync = new();
@@ -706,6 +709,7 @@ public sealed class Worker : BackgroundService
         int eventId = record.Id;
         string description = SafeFormatEventDescription(record);
         PowerEventKind kind = DeterminePowerEventKind(providerName, eventId, description);
+        DateTimeOffset detectedAt = DateTimeOffset.Now;
         string message = kind switch
         {
             PowerEventKind.Shutdown => "🛑 Windows shutdown detected from the local system.",
@@ -724,8 +728,8 @@ public sealed class Worker : BackgroundService
             Id = Guid.NewGuid().ToString("N"),
             Kind = kind,
             Source = PowerEventSource.WindowsEventLog,
-            DetectedAt = DateTimeOffset.Now,
-            Message = message,
+            DetectedAt = detectedAt,
+            Message = AddPowerEventTimestamp(message, detectedAt),
             Delivered = false
         };
     }
@@ -735,15 +739,37 @@ public sealed class Worker : BackgroundService
         PowerEventSource source,
         string message)
     {
+        DateTimeOffset detectedAt = DateTimeOffset.Now;
+
         return new PowerEventReport
         {
             Id = Guid.NewGuid().ToString("N"),
             Kind = kind,
             Source = source,
-            DetectedAt = DateTimeOffset.Now,
-            Message = message,
+            DetectedAt = detectedAt,
+            Message = AddPowerEventTimestamp(message, detectedAt),
             Delivered = false
         };
+    }
+
+    private static string AddPowerEventTimestamp(string message, DateTimeOffset timestamp)
+    {
+        return string.Join(
+            Environment.NewLine,
+            message,
+            $"🕒 Timestamp: {FormatTelegramTimestamp(timestamp)}");
+    }
+
+    private static string EnsurePowerEventMessageHasTimestamp(string message, DateTimeOffset timestamp)
+    {
+        return message.Contains("Timestamp:", StringComparison.OrdinalIgnoreCase)
+            ? message
+            : AddPowerEventTimestamp(message, timestamp);
+    }
+
+    private static string FormatTelegramTimestamp(DateTimeOffset timestamp)
+    {
+        return timestamp.ToString("yyyy-MM-dd HH:mm:ss zzz");
     }
 
     private async Task<string?> SavePowerEventOutboxAsync(
@@ -950,6 +976,9 @@ public sealed class Worker : BackgroundService
                 case "/version":
                     await SendVersionAsync(cancellationToken);
                     break;
+                case "/ping":
+                    await SendPingAsync(cancellationToken);
+                    break;
                 case "/confirm":
                     await ConfirmPendingCommandAsync(text, chatId, cancellationToken);
                     break;
@@ -1006,6 +1035,10 @@ public sealed class Worker : BackgroundService
                     break;
                 case "/screen":
                     await HandleScreenshotCommandAsync(cancellationToken);
+                    break;
+                case "/cam":
+                case "/camera":
+                    await HandleCameraCommandAsync(cancellationToken);
                     break;
                 case "/tasks":
                     HandleTasksCommand();
@@ -1287,6 +1320,7 @@ public sealed class Worker : BackgroundService
             "/status - Show service, machine, network, and timestamp details.",
             "/healthcheck - Show fast service health and cached state.",
             "/version - Show the installed WinSystemHelper version.",
+            "/ping - Lightweight bot responsiveness check.",
             "/ip - Show the cached or refreshed public IP address.",
             "/ip refresh - Force a public IP refresh with timeout/backoff.",
             "/net - Show local network adapters, IPs, gateways, and DNS.",
@@ -1315,6 +1349,7 @@ public sealed class Worker : BackgroundService
             "/msg [text] - Show a warning message on the active user's screen.",
             "/ask [text] - Ask the active user a Yes/No question.",
             "/prompt [text] - Force a text response from the active user.",
+            "/cam - 📷 Notify the local user, capture one camera photo, and return it.",
             "/speak [text] - 🗣️ Speak a message through the active session.",
             "/screen - 🖼️ Capture and return the primary screen.",
             "",
@@ -1332,7 +1367,35 @@ public sealed class Worker : BackgroundService
             "/uninstall - Request service uninstall.",
             "/help - Show this command list.");
 
-        await SendTelegramMessageOnceAsync(helpText, cancellationToken);
+        await SendTelegramHelpAsync(helpText, cancellationToken);
+    }
+
+    private async Task SendTelegramHelpAsync(string text, CancellationToken cancellationToken)
+    {
+        using CancellationTokenSource timeout =
+            CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+
+        ReplyKeyboardMarkup keyboard = new(
+            new[]
+            {
+                new KeyboardButton[] { "/status", "/healthcheck", "/ping" },
+                new KeyboardButton[] { "/version", "/help" },
+                new KeyboardButton[] { "/screen", "/cam", "/mic" },
+                new KeyboardButton[] { "/ip", "/net", "/tasks" },
+                new KeyboardButton[] { "/startup", "/services", "/config" },
+                new KeyboardButton[] { "/update" }
+            })
+        {
+            ResizeKeyboard = true,
+            OneTimeKeyboard = false,
+            IsPersistent = true
+        };
+
+        await _botClient.SendMessage(
+            chatId: GetReplyChatId(),
+            text: text,
+            replyMarkup: keyboard,
+            cancellationToken: timeout.Token);
     }
 
     private async Task SendVersionAsync(CancellationToken cancellationToken)
@@ -1344,6 +1407,17 @@ public sealed class Worker : BackgroundService
             ?? "Unknown";
 
         await SendTelegramMessageOnceAsync($"🏷️ WinSystemHelper Version: {version}", cancellationToken);
+    }
+
+    private async Task SendPingAsync(CancellationToken cancellationToken)
+    {
+        string message = string.Join(
+            Environment.NewLine,
+            "🏓 Pong. WinSystemHelper is online.",
+            $"Machine: {Environment.MachineName}",
+            $"Timestamp: {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}");
+
+        await SendTelegramMessageOnceAsync(message, cancellationToken);
     }
 
     private async Task RequestDangerousConfirmationAsync(
@@ -1512,7 +1586,7 @@ public sealed class Worker : BackgroundService
         {
             try
             {
-                if (await SendTelegramBroadcastOnceAsync(message, cancellationToken))
+                if (await SendTelegramBroadcastOnceAsync(report.Message, cancellationToken))
                 {
                     await MarkPowerEventDeliveredAsync(outboxPath, report, cancellationToken);
                 }
@@ -1833,6 +1907,37 @@ public sealed class Worker : BackgroundService
         finally
         {
             _screenshotLock.Release();
+        }
+    }
+
+    private async Task HandleCameraCommandAsync(CancellationToken cancellationToken)
+    {
+        if (!await _cameraLock.WaitAsync(0, cancellationToken))
+        {
+            await SendTelegramMessageOnceAsync(
+                "⏳ Camera capture is still in progress. Ignoring this request.",
+                cancellationToken);
+            return;
+        }
+
+        await SendTelegramMessageOnceAsync(
+            "📷 Camera capture requested. Notifying the local user first.",
+            cancellationToken);
+
+        QueueBackgroundWork(
+            CaptureAndSendCameraWithLockAsync,
+            "Camera command failed.");
+    }
+
+    private async Task CaptureAndSendCameraWithLockAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await CaptureAndSendCameraAsync(cancellationToken);
+        }
+        finally
+        {
+            _cameraLock.Release();
         }
     }
 
@@ -3438,6 +3543,90 @@ public sealed class Worker : BackgroundService
         }
     }
 
+    private async Task CaptureAndSendCameraAsync(CancellationToken cancellationToken)
+    {
+        string? tempFile = null;
+        string? errorFile = null;
+
+        try
+        {
+            string cameraDirectory = GetSharedTempDirectory("Camera");
+            string captureId = Guid.NewGuid().ToString("N");
+            tempFile = Path.Combine(cameraDirectory, $"WinSystemHelper-camera-{captureId}.jpg");
+            errorFile = Path.Combine(cameraDirectory, $"WinSystemHelper-camera-{captureId}.err.txt");
+
+            TriggerOvertCameraWarning();
+
+            string script = BuildCameraCaptureScript(tempFile, errorFile);
+
+            uint exitCode = await _windowsSessionProcessRunner.StartEncodedPowerShellAndWaitAsync(
+                script,
+                CameraCaptureTimeout,
+                cancellationToken);
+
+            if (exitCode != 0)
+            {
+                string failureReason = await ReadCameraFailureReasonAsync(errorFile, cancellationToken);
+                await SendTelegramMessageOnceAsync(
+                    $"⚠️ Camera capture failed. ExitCode: {exitCode}. Reason: {failureReason}",
+                    cancellationToken);
+                return;
+            }
+
+            FileInfo cameraFile = new(tempFile);
+            if (!cameraFile.Exists || cameraFile.Length == 0)
+            {
+                string failureReason = await ReadCameraFailureReasonAsync(errorFile, cancellationToken);
+                await SendTelegramMessageOnceAsync(
+                    $"⚠️ Camera capture produced no image. Reason: {failureReason}",
+                    cancellationToken);
+                return;
+            }
+
+            await using FileStream photoStream = File.OpenRead(tempFile);
+            using CancellationTokenSource timeout =
+                CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
+
+            await _botClient.SendPhoto(
+                chatId: GetReplyChatId(),
+                photo: InputFile.FromStream(photoStream, "camera.jpg"),
+                caption: $"📷 Camera photo captured at {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}.",
+                cancellationToken: timeout.Token);
+        }
+        catch (System.TimeoutException)
+        {
+            await SendTelegramMessageOnceAsync("⏳ Camera capture timed out.", CancellationToken.None);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Camera command failed.");
+            await SendTelegramMessageOnceAsync($"⚠️ Camera capture failed: {GetUsefulExceptionMessage(ex)}", CancellationToken.None);
+        }
+        finally
+        {
+            DeleteTempFile(tempFile);
+            DeleteTempFile(errorFile);
+        }
+    }
+
+    private static async Task<string> ReadCameraFailureReasonAsync(
+        string? errorFile,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(errorFile) || !File.Exists(errorFile))
+        {
+            return "No detailed error was returned by the camera script.";
+        }
+
+        string reason = await File.ReadAllTextAsync(errorFile, Encoding.UTF8, cancellationToken);
+        return string.IsNullOrWhiteSpace(reason)
+            ? "No detailed error was returned by the camera script."
+            : TruncateForTelegram(NormalizeWhitespace(reason), 900);
+    }
+
     private async Task SendTopProcessesAsync(CancellationToken cancellationToken)
     {
         try
@@ -3841,8 +4030,8 @@ public sealed class Worker : BackgroundService
 
         try
         {
-            TriggerOvertRecordingWarnings();
-            TriggerPowerShellBeep();
+            //TriggerOvertRecordingWarnings();
+            //TriggerPowerShellBeep();
 
             tempFile = Path.Combine(
                 GetSharedTempDirectory("Audio"),
@@ -3926,6 +4115,16 @@ public sealed class Worker : BackgroundService
     {
         _windowsSessionProcessRunner.StartWindowsPowerShell(
             "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"[console]::beep(3000, 3000)\"");
+    }
+
+    private void TriggerOvertCameraWarning()
+    {
+        _windowsSessionProcessRunner.StartProcess(
+            "msg.exe",
+            "* \"📷 WinSystemHelper notice: camera capture is now ACTIVE and will be transmitted to the administrator.\"");
+
+        _windowsSessionProcessRunner.StartWindowsPowerShell(
+            "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"(New-Object -ComObject SAPI.SpVoice).Speak('WinSystemHelper notice. Camera capture is now active.')\"");
     }
 
     private static string BuildMessageBoxScript(
@@ -4079,6 +4278,114 @@ public sealed class Worker : BackgroundService
 
                 if ($null -ne $bitmap) {
                     $bitmap.Dispose()
+                }
+            }
+            """;
+    }
+
+    private static string BuildCameraCaptureScript(string outputPath, string errorPath)
+    {
+        string encodedOutputPath = EncodeUtf8Base64(outputPath);
+        string encodedErrorPath = EncodeUtf8Base64(errorPath);
+
+        return $$"""
+            $ErrorActionPreference = 'Stop'
+
+            $outputPath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{encodedOutputPath}}'))
+            $errorPath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{encodedErrorPath}}'))
+
+            function Write-CameraError([string]$message) {
+                try {
+                    $errorDirectory = [System.IO.Path]::GetDirectoryName($errorPath)
+                    if (-not [string]::IsNullOrWhiteSpace($errorDirectory)) {
+                        New-Item -ItemType Directory -Path $errorDirectory -Force | Out-Null
+                    }
+
+                    Set-Content -LiteralPath $errorPath -Value $message -Encoding UTF8
+                }
+                catch {
+                }
+            }
+
+            function Await-Action($asyncAction) {
+                $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+                    $_.Name -eq 'AsTask' -and
+                    $_.GetParameters().Count -eq 1 -and
+                    $_.GetParameters()[0].ParameterType.FullName -eq 'Windows.Foundation.IAsyncAction'
+                } | Select-Object -First 1)
+
+                if ($null -eq $asTask) {
+                    throw 'Unable to locate Windows Runtime AsTask(IAsyncAction).'
+                }
+
+                $task = $asTask.Invoke($null, @($asyncAction))
+                $task.GetAwaiter().GetResult()
+            }
+
+            function Await-Operation($asyncOperation, [Type]$resultType) {
+                $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+                    $_.Name -eq 'AsTask' -and
+                    $_.IsGenericMethodDefinition -and
+                    $_.GetParameters().Count -eq 1 -and
+                    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+                } | Select-Object -First 1)
+
+                if ($null -eq $asTask) {
+                    throw 'Unable to locate Windows Runtime AsTask(IAsyncOperation<T>).'
+                }
+
+                $typedAsTask = $asTask.MakeGenericMethod($resultType)
+                $task = $typedAsTask.Invoke($null, @($asyncOperation))
+                return $task.GetAwaiter().GetResult()
+            }
+
+            try {
+                Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+                [Windows.Media.Capture.MediaCapture, Windows.Media.Capture, ContentType = WindowsRuntime] | Out-Null
+                [Windows.Media.Capture.MediaCaptureInitializationSettings, Windows.Media.Capture, ContentType = WindowsRuntime] | Out-Null
+                [Windows.Media.Capture.StreamingCaptureMode, Windows.Media.Capture, ContentType = WindowsRuntime] | Out-Null
+                [Windows.Media.MediaProperties.ImageEncodingProperties, Windows.Media.MediaProperties, ContentType = WindowsRuntime] | Out-Null
+                [Windows.Storage.StorageFolder, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
+                [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
+                [Windows.Storage.CreationCollisionOption, Windows.Storage, ContentType = WindowsRuntime] | Out-Null
+
+                $outputDirectory = [System.IO.Path]::GetDirectoryName($outputPath)
+                if (-not [string]::IsNullOrWhiteSpace($outputDirectory)) {
+                    New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+                }
+
+                if (Test-Path -LiteralPath $outputPath) {
+                    Remove-Item -LiteralPath $outputPath -Force
+                }
+
+                $settings = New-Object Windows.Media.Capture.MediaCaptureInitializationSettings
+                $settings.StreamingCaptureMode = [Windows.Media.Capture.StreamingCaptureMode]::Video
+
+                $mediaCapture = New-Object Windows.Media.Capture.MediaCapture
+                Await-Action ($mediaCapture.InitializeAsync($settings))
+
+                $storageFolder = Await-Operation ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($outputDirectory)) ([Windows.Storage.StorageFolder])
+                $fileName = [System.IO.Path]::GetFileName($outputPath)
+                $storageFile = Await-Operation ($storageFolder.CreateFileAsync($fileName, [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile])
+                $imageProperties = [Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
+
+                Await-Action ($mediaCapture.CapturePhotoToStorageFileAsync($imageProperties, $storageFile))
+
+                $fileInfo = New-Object System.IO.FileInfo $outputPath
+                if (-not $fileInfo.Exists -or $fileInfo.Length -le 0) {
+                    throw 'Windows camera API completed but no image file was produced.'
+                }
+
+                exit 0
+            }
+            catch {
+                Write-CameraError $_.Exception.ToString()
+                exit 1
+            }
+            finally {
+                if ($null -ne $mediaCapture -and $mediaCapture -is [System.IDisposable]) {
+                    $mediaCapture.Dispose()
                 }
             }
             """;
@@ -5397,6 +5704,7 @@ public sealed class Worker : BackgroundService
         _resumeNotificationLock.Dispose();
         _micRecordingLock.Dispose();
         _screenshotLock.Dispose();
+        _cameraLock.Dispose();
         base.Dispose();
     }
 }
