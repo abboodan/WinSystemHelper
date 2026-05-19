@@ -1378,12 +1378,8 @@ public sealed class Worker : BackgroundService
         ReplyKeyboardMarkup keyboard = new(
             new[]
             {
-                new KeyboardButton[] { "/status", "/healthcheck", "/ping" },
-                new KeyboardButton[] { "/version", "/help" },
-                new KeyboardButton[] { "/screen", "/cam", "/mic" },
-                new KeyboardButton[] { "/ip", "/net", "/tasks" },
-                new KeyboardButton[] { "/startup", "/services", "/config" },
-                new KeyboardButton[] { "/update" }
+                new KeyboardButton[] { "/ping", "/help" },
+                new KeyboardButton[] { "/config", "/update" }
             })
         {
             ResizeKeyboard = true,

@@ -4,6 +4,7 @@
 build-verify/
 build-verify-bootstrapper/
 build.log
+git-push.log
 publish/
 artifacts/
 dist/
