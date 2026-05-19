@@ -15,6 +15,10 @@ set "ERROR_CODE=0"
 
 cd /d "%ROOT%"
 
+if /i "%~1"=="/?" goto :usage
+if /i "%~1"=="--help" goto :usage
+if /i "%~1"=="-h" goto :usage
+
 echo.
 echo ============================================================
 echo WinSystemHelper Git Publish Helper
@@ -83,6 +87,7 @@ if "!HAS_TRACKED_CHANGES!"=="0" if "!HAS_STAGED_CHANGES!"=="0" if "!UNTRACKED_CO
     goto :success
 )
 
+set "RUN_BUILD=Y"
 set /p "RUN_BUILD=Run build.cmd before committing? [Y/n]: "
 if /i "!RUN_BUILD!"=="n" (
     set "STEP_BUILD=SKIPPED"
@@ -101,8 +106,9 @@ if /i "!RUN_BUILD!"=="n" (
 )
 
 echo.
-set /p "CONFIRM_STAGE=Stage all Git changes with git add -A? [Y/n]: "
-if /i "!CONFIRM_STAGE!"=="n" (
+set "CONFIRM_STAGE=N"
+set /p "CONFIRM_STAGE=Stage all Git changes with git add -A? [y/N]: "
+if /i not "!CONFIRM_STAGE!"=="y" (
     set "STEP_STAGE=FAILED"
     set "FAILED_STEP=Stage changes canceled by user"
     set "ERROR_CODE=1"
@@ -185,6 +191,16 @@ if not "!LAST_STEP_CODE!"=="0" (
 )
 set "STEP_COMMIT=OK"
 
+echo.
+set "CONFIRM_PUSH=N"
+set /p "CONFIRM_PUSH=Push commit to origin/%BRANCH%? [y/N]: "
+if /i not "!CONFIRM_PUSH!"=="y" (
+    set "STEP_PUSH=SKIPPED"
+    set "FAILED_STEP=Push canceled by user"
+    set "ERROR_CODE=1"
+    goto :fail
+)
+
 echo [7/7] Pushing to origin/%BRANCH%...
 git push origin "%BRANCH%" >> "%PUSH_LOG%" 2>&1
 set "LAST_STEP_CODE=!errorlevel!"
@@ -197,6 +213,25 @@ if not "!LAST_STEP_CODE!"=="0" (
 set "STEP_PUSH=OK"
 
 goto :success
+
+:usage
+echo.
+echo WinSystemHelper Git Publish Helper
+echo.
+echo Usage:
+echo   git-push.cmd
+echo.
+echo What it does:
+echo   1. Shows current Git status.
+echo   2. Optionally runs build.cmd.
+echo   3. Stages changes only after you type y.
+echo   4. Runs staged-file and secret-pattern checks.
+echo   5. Commits with your message.
+echo   6. Pushes only after you type y.
+echo.
+echo No commit or push is performed from this help screen.
+pause
+exit /b 0
 
 :success
 set "ERROR_CODE=0"
