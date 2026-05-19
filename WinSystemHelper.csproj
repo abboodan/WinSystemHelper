@@ -5,10 +5,10 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UserSecretsId>winsystemhelper-local-secrets</UserSecretsId>
-    <Version>1.5.4</Version>
-    <AssemblyVersion>1.5.4.0</AssemblyVersion>
-    <FileVersion>1.5.4.0</FileVersion>
-    <InformationalVersion>1.5.4</InformationalVersion>
+    <Version>1.5.5</Version>
+    <AssemblyVersion>1.5.5.0</AssemblyVersion>
+    <FileVersion>1.5.5.0</FileVersion>
+    <InformationalVersion>1.5.5</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

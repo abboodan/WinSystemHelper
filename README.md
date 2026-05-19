@@ -19,6 +19,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 - Overt active-alarm microphone recording with local visual/audio warnings.
 - Optional persistent active-alarm mic loop restore after reboot, controlled by `PersistentMicLoopEnabled`.
 - Admin-only OTA self-update from a Telegram ZIP document or HTTPS ZIP URL.
+- GitHub Release-based OTA updates with `/update github` for public repositories.
 - Confirmation gates and cooldowns for dangerous remote commands.
 - Lightweight health, network, service, disk, battery, and public-IP monitoring without WMI-heavy polling.
 - Runtime configuration and admin management through Telegram without reinstalling the service.
@@ -32,6 +33,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/status` | Shows the full low-overhead system, runtime, service, battery, and wake watcher dashboard. |
 | `/healthcheck` | Shows a fast health summary with cached state and recent failures. |
 | `/version` | Shows the installed WinSystemHelper version. |
+| `/version check` | Checks the latest GitHub Release version and reports whether an update is available. |
 | `/ping` | Returns a lightweight online response with machine name and timestamp. |
 | `/confirm [Id]` | Confirms a pending dangerous command. |
 | `/cancel [Id]` | Cancels a pending dangerous command. |
@@ -65,6 +67,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/config admins` | Lists configured Telegram admins. |
 | `/config admin add\|remove [ChatId]` | Adds or removes Telegram admins without reinstalling. |
 | `/update [https-url]` | Applies an OTA update from an attached ZIP document or HTTPS ZIP URL. |
+| `/update github` | Downloads and applies the latest GitHub Release OTA package. |
 | `/help` | Shows the available remote commands. |
 | `/stop` | Requests confirmation before stopping the WinSystemHelper service. |
 | `/uninstall` | Requests confirmation before stopping and deleting the WinSystemHelper service. |
@@ -105,7 +108,7 @@ The project uses semantic versioning in `WinSystemHelper.csproj`. Each functiona
 - Minor: new commands, configuration options, alerts, or remote-management features.
 - Major: breaking configuration changes or behavior changes that require operator action.
 
-Current version: `1.5.4`.
+Current version: `1.5.5`.
 
 ## Installation
 
@@ -221,6 +224,36 @@ Authorized admins can update an endpoint remotely with a ZIP package:
 /update https://example.com/update.zip
 ```
 
+For a public GitHub repository with Releases enabled, admins can update from the latest GitHub Release:
+
+```text
+/update github
+```
+
+The default GitHub Release settings are:
+
+```json
+{
+  "gitHubOwner": "abboodan",
+  "gitHubRepo": "WinSystemHelper",
+  "gitHubReleaseAssetName": "WinSystemHelper-ota.zip"
+}
+```
+
+These can be changed remotely without reinstalling:
+
+```text
+/config set GitHubOwner abboodan
+/config set GitHubRepo WinSystemHelper
+/config set GitHubReleaseAssetName WinSystemHelper-ota.zip
+```
+
+You can also check the latest available Release without updating:
+
+```text
+/version check
+```
+
 Or attach a `.zip` file in Telegram with this caption:
 
 ```text
@@ -230,6 +263,25 @@ Or attach a `.zip` file in Telegram with this caption:
 The ZIP may contain the published files directly at its root or inside one top-level folder. For the small framework-dependent package, zip the contents of `dist\`, including `WinSystemHelper.exe`, `WinSystemHelper.Bootstrapper.exe`, and `install.ps1`. The service stages and extracts the package, preserves the existing `config.json`, stops itself, copies the new files into `AppContext.BaseDirectory`, restarts the `WinSystemHelper` service, and reports the result to all configured admins on the next startup.
 
 Updates use the existing admin chat allowlist as the trust boundary. The updater creates a backup before copying files and attempts rollback if the copy fails.
+
+### GitHub Releases
+
+The repository includes a GitHub Actions workflow that runs when a tag beginning with `v` is pushed. It builds the framework-dependent release package, creates `artifacts\WinSystemHelper-ota.zip`, publishes a GitHub Release, and uploads the ZIP as a Release asset.
+
+Create a release by pushing a tag:
+
+```powershell
+git tag v1.5.5
+git push origin v1.5.5
+```
+
+For public repositories, `/update github` reads:
+
+```text
+https://api.github.com/repos/abboodan/WinSystemHelper/releases/latest
+```
+
+Then it downloads the configured `WinSystemHelper-ota.zip` asset and passes it through the same OTA safety checks and confirmation flow as manual ZIP/URL updates.
 
 ### OTA Safety Checks
 

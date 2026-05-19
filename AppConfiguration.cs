@@ -39,6 +39,12 @@ public sealed class AppConfiguration
 
     public int PowerCommandPreDelaySeconds { get; set; } = 3;
 
+    public string GitHubOwner { get; set; } = "abboodan";
+
+    public string GitHubRepo { get; set; } = "WinSystemHelper";
+
+    public string GitHubReleaseAssetName { get; set; } = "WinSystemHelper-ota.zip";
+
     public IReadOnlyList<long> GetEffectiveAdminChatIds()
     {
         if (AdminChatIds.Length > 0)

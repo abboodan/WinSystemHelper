@@ -35,6 +35,7 @@ public sealed class Worker : BackgroundService
     private static readonly TimeSpan ScreenshotTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan CameraCaptureTimeout = TimeSpan.FromSeconds(25);
     private static readonly TimeSpan UpdateDownloadTimeout = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan GitHubReleaseLookupTimeout = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan PublicIpRefreshTimeout = TimeSpan.FromSeconds(3);
     private static readonly Uri TelegramApiBaseUri = new("https://api.telegram.org");
     private static readonly Uri PublicIpUri = new("https://api.ipify.org");
@@ -124,6 +125,12 @@ public sealed class Worker : BackgroundService
     private PowerEventKind _lastBotPowerCommandKind = PowerEventKind.Unknown;
     private DateTimeOffset _lastBotPowerCommandAt = DateTimeOffset.MinValue;
     private bool _repeatedTelegramFailureAlertActive;
+
+    private sealed record GitHubReleaseInfo(
+        string TagName,
+        string AssetName,
+        Uri AssetDownloadUri,
+        DateTimeOffset PublishedAt);
 
     public Worker(
         ILogger<Worker> logger,
@@ -974,7 +981,7 @@ public sealed class Worker : BackgroundService
                     await SendHealthCheckAsync(cancellationToken);
                     break;
                 case "/version":
-                    await SendVersionAsync(cancellationToken);
+                    await SendVersionAsync(text, cancellationToken);
                     break;
                 case "/ping":
                     await SendPingAsync(cancellationToken);
@@ -1320,6 +1327,7 @@ public sealed class Worker : BackgroundService
             "/status - Show service, machine, network, and timestamp details.",
             "/healthcheck - Show fast service health and cached state.",
             "/version - Show the installed WinSystemHelper version.",
+            "/version check - Check the latest GitHub Release version.",
             "/ping - Lightweight bot responsiveness check.",
             "/ip - Show the cached or refreshed public IP address.",
             "/ip refresh - Force a public IP refresh with timeout/backoff.",
@@ -1363,6 +1371,7 @@ public sealed class Worker : BackgroundService
             "",
             "🔄 Service & Updates",
             "/update [https-url] - 🔄 Apply an OTA update from a ZIP file or attached document.",
+            "/update github - 🔄 Apply the latest GitHub Release OTA package.",
             "/stop - Request WinSystemHelper service stop.",
             "/uninstall - Request service uninstall.",
             "/help - Show this command list.");
@@ -1394,7 +1403,7 @@ public sealed class Worker : BackgroundService
             cancellationToken: timeout.Token);
     }
 
-    private async Task SendVersionAsync(CancellationToken cancellationToken)
+    private async Task SendVersionAsync(string commandText, CancellationToken cancellationToken)
     {
         Assembly assembly = typeof(Worker).Assembly;
         string version =
@@ -1402,7 +1411,45 @@ public sealed class Worker : BackgroundService
             ?? assembly.GetName().Version?.ToString()
             ?? "Unknown";
 
+        string payload = GetCommandPayload(commandText);
+        if (payload.Equals("check", StringComparison.OrdinalIgnoreCase) ||
+            payload.Equals("github", StringComparison.OrdinalIgnoreCase) ||
+            payload.Equals("latest", StringComparison.OrdinalIgnoreCase))
+        {
+            await SendGitHubVersionCheckAsync(version, cancellationToken);
+            return;
+        }
+
         await SendTelegramMessageOnceAsync($"🏷️ WinSystemHelper Version: {version}", cancellationToken);
+    }
+
+    private async Task SendGitHubVersionCheckAsync(
+        string currentVersion,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            GitHubReleaseInfo release = await GetLatestGitHubReleaseInfoAsync(cancellationToken);
+            string latestVersion = NormalizeReleaseVersion(release.TagName);
+            bool updateAvailable = IsVersionNewer(latestVersion, currentVersion);
+
+            string message = string.Join(
+                Environment.NewLine,
+                "🏷️ WinSystemHelper version check:",
+                $"Current: {currentVersion}",
+                $"Latest GitHub Release: {release.TagName}",
+                $"Asset: {release.AssetName}",
+                $"Published: {release.PublishedAt:yyyy-MM-dd HH:mm:ss zzz}",
+                $"Update available: {(updateAvailable ? "Yes" : "No")}");
+
+            await SendTelegramMessageOnceAsync(message, cancellationToken);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException or InvalidOperationException)
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ GitHub version check failed: {GetUsefulExceptionMessage(ex)}",
+                cancellationToken);
+        }
     }
 
     private async Task SendPingAsync(CancellationToken cancellationToken)
@@ -2675,6 +2722,9 @@ public sealed class Worker : BackgroundService
             $"PowerEventAlertsEnabled: {configuration.PowerEventAlertsEnabled}",
             $"PowerEventOutboxEnabled: {configuration.PowerEventOutboxEnabled}",
             $"PowerCommandPreDelaySeconds: {configuration.PowerCommandPreDelaySeconds}",
+            $"GitHubOwner: {configuration.GitHubOwner}",
+            $"GitHubRepo: {configuration.GitHubRepo}",
+            $"GitHubReleaseAssetName: {configuration.GitHubReleaseAssetName}",
             "BotToken: configured (hidden)");
     }
 
@@ -2698,7 +2748,10 @@ public sealed class Worker : BackgroundService
             configuration.AllowCrossAdminConfirmations,
             configuration.PowerEventAlertsEnabled,
             configuration.PowerEventOutboxEnabled,
-            configuration.PowerCommandPreDelaySeconds
+            configuration.PowerCommandPreDelaySeconds,
+            configuration.GitHubOwner,
+            configuration.GitHubRepo,
+            configuration.GitHubReleaseAssetName
         };
 
         return string.Join(
@@ -2729,7 +2782,7 @@ public sealed class Worker : BackgroundService
         if (message.Document is null && string.IsNullOrWhiteSpace(GetCommandPayload(commandText)))
         {
             await SendTelegramMessageOnceAsync(
-                "⚠️ Usage: send /update https://example.com/update.zip or attach a .zip file with caption /update.",
+                "⚠️ Usage: send /update github, /update https://example.com/update.zip, or attach a .zip file with caption /update.",
                 cancellationToken);
             return;
         }
@@ -2803,12 +2856,20 @@ public sealed class Worker : BackgroundService
                 if (string.IsNullOrWhiteSpace(urlText))
                 {
                     await SendTelegramMessageOnceAsync(
-                        "⚠️ Usage: send /update https://example.com/update.zip or attach a .zip file with caption /update.",
+                        "⚠️ Usage: send /update github, /update https://example.com/update.zip, or attach a .zip file with caption /update.",
                         cancellationToken);
                     return;
                 }
 
-                if (!TryParseUpdateUri(urlText, out Uri? updateUri, out string? uriError))
+                Uri? updateUri;
+                if (IsGitHubUpdateAlias(urlText))
+                {
+                    updateStage = "resolving latest GitHub Release update asset";
+                    GitHubReleaseInfo release = await GetLatestGitHubReleaseInfoAsync(cancellationToken);
+                    updateUri = release.AssetDownloadUri;
+                    updateStage = $"downloading GitHub Release '{release.TagName}' asset '{release.AssetName}'";
+                }
+                else if (!TryParseUpdateUri(urlText, out updateUri, out string? uriError))
                 {
                     await SendTelegramMessageOnceAsync($"⚠️ Update URL rejected: {uriError}", cancellationToken);
                     return;
@@ -4623,6 +4684,118 @@ public sealed class Worker : BackgroundService
         return _windowsSessionProcessRunner.TryGetActiveUserSid();
     }
 
+    private static bool IsGitHubUpdateAlias(string value)
+    {
+        return value.Equals("github", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("latest", StringComparison.OrdinalIgnoreCase) ||
+            value.Equals("release", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<GitHubReleaseInfo> GetLatestGitHubReleaseInfoAsync(CancellationToken cancellationToken)
+    {
+        AppConfiguration configuration = GetConfigurationSnapshot();
+        string owner = configuration.GitHubOwner.Trim();
+        string repo = configuration.GitHubRepo.Trim();
+        string assetName = configuration.GitHubReleaseAssetName.Trim();
+
+        if (string.IsNullOrWhiteSpace(owner) ||
+            string.IsNullOrWhiteSpace(repo) ||
+            string.IsNullOrWhiteSpace(assetName))
+        {
+            throw new InvalidOperationException(
+                "GitHubOwner, GitHubRepo, and GitHubReleaseAssetName must be configured.");
+        }
+
+        Uri apiUri = new(
+            $"https://api.github.com/repos/{Uri.EscapeDataString(owner)}/{Uri.EscapeDataString(repo)}/releases/latest");
+
+        using CancellationTokenSource timeout =
+            CreateTimeoutTokenSource(cancellationToken, GitHubReleaseLookupTimeout);
+
+        using HttpClient httpClient = _httpClientFactory.CreateClient();
+        httpClient.Timeout = Timeout.InfiniteTimeSpan;
+        httpClient.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "WinSystemHelper");
+        httpClient.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/vnd.github+json");
+
+        using HttpResponseMessage response = await httpClient.GetAsync(
+            apiUri,
+            HttpCompletionOption.ResponseHeadersRead,
+            timeout.Token);
+
+        response.EnsureSuccessStatusCode();
+
+        await using Stream responseStream = await response.Content.ReadAsStreamAsync(timeout.Token);
+        using JsonDocument document = await JsonDocument.ParseAsync(responseStream, cancellationToken: timeout.Token);
+        JsonElement root = document.RootElement;
+
+        string tagName = root.TryGetProperty("tag_name", out JsonElement tagElement)
+            ? tagElement.GetString() ?? "unknown"
+            : "unknown";
+
+        DateTimeOffset publishedAt = DateTimeOffset.Now;
+        if (root.TryGetProperty("published_at", out JsonElement publishedElement) &&
+            DateTimeOffset.TryParse(publishedElement.GetString(), out DateTimeOffset parsedPublishedAt))
+        {
+            publishedAt = parsedPublishedAt;
+        }
+
+        if (!root.TryGetProperty("assets", out JsonElement assetsElement) ||
+            assetsElement.ValueKind != JsonValueKind.Array)
+        {
+            throw new InvalidOperationException("Latest GitHub Release contains no assets.");
+        }
+
+        foreach (JsonElement assetElement in assetsElement.EnumerateArray())
+        {
+            string? currentAssetName = assetElement.TryGetProperty("name", out JsonElement nameElement)
+                ? nameElement.GetString()
+                : null;
+
+            if (!string.Equals(currentAssetName, assetName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            string? downloadUrl = assetElement.TryGetProperty("browser_download_url", out JsonElement urlElement)
+                ? urlElement.GetString()
+                : null;
+
+            if (!Uri.TryCreate(downloadUrl, UriKind.Absolute, out Uri? assetUri) ||
+                !assetUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"GitHub Release asset '{assetName}' has no valid HTTPS download URL.");
+            }
+
+            return new GitHubReleaseInfo(tagName, currentAssetName!, assetUri, publishedAt);
+        }
+
+        throw new InvalidOperationException(
+            $"Latest GitHub Release '{tagName}' does not contain asset '{assetName}'.");
+    }
+
+    private static string NormalizeReleaseVersion(string version)
+    {
+        string normalized = version.Trim();
+        return normalized.StartsWith("v", StringComparison.OrdinalIgnoreCase)
+            ? normalized[1..]
+            : normalized;
+    }
+
+    private static bool IsVersionNewer(string latestVersion, string currentVersion)
+    {
+        string latest = NormalizeReleaseVersion(latestVersion);
+        string current = NormalizeReleaseVersion(currentVersion);
+
+        if (Version.TryParse(latest, out Version? latestParsed) &&
+            Version.TryParse(current, out Version? currentParsed))
+        {
+            return latestParsed > currentParsed;
+        }
+
+        return !string.Equals(latest, current, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsZipFileName(string? fileName)
     {
         return !string.IsNullOrWhiteSpace(fileName) &&
@@ -4760,7 +4933,10 @@ public sealed class Worker : BackgroundService
                 AllowCrossAdminConfirmations = _configuration.AllowCrossAdminConfirmations,
                 PowerEventAlertsEnabled = _configuration.PowerEventAlertsEnabled,
                 PowerEventOutboxEnabled = _configuration.PowerEventOutboxEnabled,
-                PowerCommandPreDelaySeconds = _configuration.PowerCommandPreDelaySeconds
+                PowerCommandPreDelaySeconds = _configuration.PowerCommandPreDelaySeconds,
+                GitHubOwner = _configuration.GitHubOwner,
+                GitHubRepo = _configuration.GitHubRepo,
+                GitHubReleaseAssetName = _configuration.GitHubReleaseAssetName
             };
         }
     }
@@ -4920,6 +5096,24 @@ public sealed class Worker : BackgroundService
                         number => _configuration.PowerCommandPreDelaySeconds = number,
                         "PowerCommandPreDelaySeconds",
                         out result);
+                case "githubowner":
+                    return TrySetStringConfigurationValue(
+                        value,
+                        text => _configuration.GitHubOwner = text,
+                        "GitHubOwner",
+                        out result);
+                case "githubrepo":
+                    return TrySetStringConfigurationValue(
+                        value,
+                        text => _configuration.GitHubRepo = text,
+                        "GitHubRepo",
+                        out result);
+                case "githubreleaseassetname":
+                    return TrySetStringConfigurationValue(
+                        value,
+                        text => _configuration.GitHubReleaseAssetName = text,
+                        "GitHubReleaseAssetName",
+                        out result);
                 default:
                     result = $"Unknown configuration key: {key}.";
                     return false;
@@ -4943,6 +5137,24 @@ public sealed class Worker : BackgroundService
 
         assign(number);
         result = $"{name} set to {number}.";
+        return true;
+    }
+
+    private static bool TrySetStringConfigurationValue(
+        string value,
+        Action<string> assign,
+        string name,
+        out string? result)
+    {
+        string text = value.Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            result = $"{name} cannot be empty.";
+            return false;
+        }
+
+        assign(text);
+        result = $"{name} set to {text}.";
         return true;
     }
 

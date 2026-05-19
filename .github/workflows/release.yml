@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build and publish OTA package
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build release package
+        shell: cmd
+        run: build.cmd
+
+      - name: Verify OTA package
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:GITHUB_WORKSPACE "artifacts\WinSystemHelper-ota.zip"
+          if (-not (Test-Path -LiteralPath $package)) {
+            throw "OTA package was not created: $package"
+          }
+
+          $items = tar -tf $package
+          foreach ($required in @("WinSystemHelper.exe", "WinSystemHelper.Bootstrapper.exe", "install.ps1", "README.md")) {
+            if ($items -notcontains $required) {
+              throw "OTA package is missing required file: $required"
+            }
+          }
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $package = Join-Path $env:GITHUB_WORKSPACE "artifacts\WinSystemHelper-ota.zip"
+          gh release create $tag $package `
+            --repo "${{ github.repository }}" `
+            --title "WinSystemHelper $tag" `
+            --notes "Automated WinSystemHelper OTA release for $tag."

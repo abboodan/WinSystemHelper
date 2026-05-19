@@ -70,7 +70,7 @@ public sealed class TelegramMenuService
         [
             new BotCommand { Command = "status", Description = "Show service status" },
             new BotCommand { Command = "healthcheck", Description = "Show fast healthcheck" },
-            new BotCommand { Command = "version", Description = "Show installed version" },
+            new BotCommand { Command = "version", Description = "Show or check installed version" },
             new BotCommand { Command = "ping", Description = "Check bot responsiveness" },
             new BotCommand { Command = "confirm", Description = "Confirm pending command" },
             new BotCommand { Command = "cancel", Description = "Cancel pending command" },
