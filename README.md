@@ -108,7 +108,7 @@ The project uses semantic versioning in `WinSystemHelper.csproj`. Each functiona
 - Minor: new commands, configuration options, alerts, or remote-management features.
 - Major: breaking configuration changes or behavior changes that require operator action.
 
-Current version: `1.5.5`.
+Current version: `1.5.6`.
 
 ## Installation
 
@@ -262,17 +262,21 @@ Or attach a `.zip` file in Telegram with this caption:
 
 The ZIP may contain the published files directly at its root or inside one top-level folder. For the small framework-dependent package, zip the contents of `dist\`, including `WinSystemHelper.exe`, `WinSystemHelper.Bootstrapper.exe`, and `install.ps1`. The service stages and extracts the package, preserves the existing `config.json`, stops itself, copies the new files into `AppContext.BaseDirectory`, restarts the `WinSystemHelper` service, and reports the result to all configured admins on the next startup.
 
+Telegram document updates are intended for small packages only. If the ZIP is larger than the Telegram Bot API download limit, use `/update github` or `/update https://...` instead of attaching the file in Telegram.
+
 Updates use the existing admin chat allowlist as the trust boundary. The updater creates a backup before copying files and attempts rollback if the copy fails.
 
 ### GitHub Releases
 
 The repository includes a GitHub Actions workflow that runs when a tag beginning with `v` is pushed. It builds the framework-dependent release package, creates `artifacts\WinSystemHelper-ota.zip`, publishes a GitHub Release, and uploads the ZIP as a Release asset.
 
+The build script includes size guardrails so CI fails instead of publishing a large self-contained `WinSystemHelper.exe` by accident.
+
 Create a release by pushing a tag:
 
 ```powershell
-git tag v1.5.5
-git push origin v1.5.5
+git tag v1.5.6
+git push origin v1.5.6
 ```
 
 For public repositories, `/update github` reads:

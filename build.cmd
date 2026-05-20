@@ -8,6 +8,8 @@ set "OTA_PACKAGE=%ARTIFACTS%\WinSystemHelper-ota.zip"
 set "APP_PUBLISH=%ROOT%bin\Release\net8.0-windows\win-x64\publish"
 set "BOOTSTRAPPER_PUBLISH=%ROOT%WinSystemHelper.Bootstrapper\bin\Release\net8.0-windows\win-x64\publish"
 set "BUILD_LOG=%ROOT%build.log"
+set "MAX_APP_EXE_BYTES=30000000"
+set "MAX_OTA_PACKAGE_BYTES=25000000"
 
 set "STEP_DOTNET=SKIPPED"
 set "STEP_CLEAN=SKIPPED"
@@ -18,6 +20,7 @@ set "STEP_COPY_BOOTSTRAPPER=SKIPPED"
 set "STEP_COPY_INSTALL=SKIPPED"
 set "STEP_COPY_README=SKIPPED"
 set "STEP_CLEAN_SYMBOLS=SKIPPED"
+set "STEP_SIZE_CHECK=SKIPPED"
 set "STEP_PACKAGE_ZIP=SKIPPED"
 set "FAILED_STEP=None"
 set "ERROR_CODE=0"
@@ -35,7 +38,7 @@ echo.
 
 if exist "%BUILD_LOG%" del /q "%BUILD_LOG%" 2>nul
 
-echo [1/10] Checking .NET SDK availability...
+echo [1/11] Checking .NET SDK availability...
 set "SDK_LIST=%TEMP%\winsystemhelper-sdks-%RANDOM%.tmp"
 dotnet --list-sdks > "%SDK_LIST%" 2>> "%BUILD_LOG%"
 set "LAST_STEP_CODE=!errorlevel!"
@@ -60,7 +63,7 @@ if "!SDK_LIST_SIZE!"=="0" (
 )
 set "STEP_DOTNET=OK"
 
-echo [2/10] Preparing dist folder...
+echo [2/11] Preparing dist folder...
 if exist "%DIST%" (
     rmdir /s /q "%DIST%"
     set "LAST_STEP_CODE=!errorlevel!"
@@ -83,8 +86,8 @@ if not "!LAST_STEP_CODE!"=="0" (
 set "STEP_CLEAN=OK"
 
 echo.
-echo [3/10] Publishing WinSystemHelper framework-dependent single-file app...
-dotnet publish "%ROOT%WinSystemHelper.csproj" -c Release -r win-x64 --self-contained false /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true >> "%BUILD_LOG%" 2>&1
+echo [3/11] Publishing WinSystemHelper framework-dependent single-file app...
+dotnet publish "%ROOT%WinSystemHelper.csproj" -c Release -r win-x64 --self-contained false /p:SelfContained=false /p:PublishSelfContained=false /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true >> "%BUILD_LOG%" 2>&1
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
     set "STEP_APP=FAILED"
@@ -95,7 +98,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 set "STEP_APP=OK"
 
 echo.
-echo [4/10] Publishing NativeAOT bootstrapper...
+echo [4/11] Publishing NativeAOT bootstrapper...
 dotnet publish "%ROOT%WinSystemHelper.Bootstrapper\WinSystemHelper.Bootstrapper.csproj" -c Release -r win-x64 >> "%BUILD_LOG%" 2>&1
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -107,7 +110,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 set "STEP_BOOTSTRAPPER=OK"
 
 echo.
-echo [5/10] Copying app publish output...
+echo [5/11] Copying app publish output...
 xcopy /y /e /i "%APP_PUBLISH%\*" "%DIST%\" >nul
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -118,7 +121,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 )
 set "STEP_COPY_APP=OK"
 
-echo [6/10] Copying bootstrapper...
+echo [6/11] Copying bootstrapper...
 copy /y "%BOOTSTRAPPER_PUBLISH%\WinSystemHelper.Bootstrapper.exe" "%DIST%\WinSystemHelper.Bootstrapper.exe" >nul
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -129,7 +132,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 )
 set "STEP_COPY_BOOTSTRAPPER=OK"
 
-echo [7/10] Copying install.ps1...
+echo [7/11] Copying install.ps1...
 copy /y "%ROOT%install.ps1" "%DIST%\install.ps1" >nul
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -140,7 +143,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 )
 set "STEP_COPY_INSTALL=OK"
 
-echo [8/10] Copying README.md...
+echo [8/11] Copying README.md...
 copy /y "%ROOT%README.md" "%DIST%\README.md" >nul
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -151,11 +154,31 @@ if not "!LAST_STEP_CODE!"=="0" (
 )
 set "STEP_COPY_README=OK"
 
-echo [9/10] Removing debug symbols from dist...
+echo [9/11] Removing debug symbols from dist...
 del /q "%DIST%\*.pdb" 2>nul
 set "STEP_CLEAN_SYMBOLS=OK"
 
-echo [10/10] Creating OTA update ZIP...
+echo [10/11] Checking release package size guardrails...
+set "APP_EXE_SIZE=0"
+if exist "%DIST%\WinSystemHelper.exe" for %%F in ("%DIST%\WinSystemHelper.exe") do set "APP_EXE_SIZE=%%~zF"
+if "!APP_EXE_SIZE!"=="0" (
+    set "STEP_SIZE_CHECK=FAILED"
+    set "FAILED_STEP=Check WinSystemHelper.exe size"
+    set "ERROR_CODE=1"
+    echo WinSystemHelper.exe is missing from dist. >> "%BUILD_LOG%"
+    goto :fail
+)
+
+if !APP_EXE_SIZE! GTR !MAX_APP_EXE_BYTES! (
+    set "STEP_SIZE_CHECK=FAILED"
+    set "FAILED_STEP=Check WinSystemHelper.exe size"
+    set "ERROR_CODE=1"
+    echo WinSystemHelper.exe is !APP_EXE_SIZE! bytes, which exceeds !MAX_APP_EXE_BYTES! bytes. The app was likely published self-contained instead of framework-dependent. >> "%BUILD_LOG%"
+    goto :fail
+)
+set "STEP_SIZE_CHECK=OK"
+
+echo [11/11] Creating OTA update ZIP...
 if not exist "%ARTIFACTS%" mkdir "%ARTIFACTS%"
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -172,6 +195,24 @@ if not "!LAST_STEP_CODE!"=="0" (
     set "STEP_PACKAGE_ZIP=FAILED"
     set "FAILED_STEP=Create OTA update ZIP"
     set "ERROR_CODE=!LAST_STEP_CODE!"
+    goto :fail
+)
+
+set "OTA_PACKAGE_SIZE=0"
+if exist "%OTA_PACKAGE%" for %%F in ("%OTA_PACKAGE%") do set "OTA_PACKAGE_SIZE=%%~zF"
+if "!OTA_PACKAGE_SIZE!"=="0" (
+    set "STEP_PACKAGE_ZIP=FAILED"
+    set "FAILED_STEP=Check OTA ZIP size"
+    set "ERROR_CODE=1"
+    echo OTA package was not created or is empty. >> "%BUILD_LOG%"
+    goto :fail
+)
+
+if !OTA_PACKAGE_SIZE! GTR !MAX_OTA_PACKAGE_BYTES! (
+    set "STEP_PACKAGE_ZIP=FAILED"
+    set "FAILED_STEP=Check OTA ZIP size"
+    set "ERROR_CODE=1"
+    echo OTA package is !OTA_PACKAGE_SIZE! bytes, which exceeds !MAX_OTA_PACKAGE_BYTES! bytes. >> "%BUILD_LOG%"
     goto :fail
 )
 set "STEP_PACKAGE_ZIP=OK"
@@ -211,6 +252,7 @@ echo Copy bootstrapper:       !STEP_COPY_BOOTSTRAPPER!
 echo Copy install.ps1:        !STEP_COPY_INSTALL!
 echo Copy README.md:          !STEP_COPY_README!
 echo Remove PDB files:        !STEP_CLEAN_SYMBOLS!
+echo Size guardrails:         !STEP_SIZE_CHECK!
 echo Create OTA ZIP:          !STEP_PACKAGE_ZIP!
 echo Failed step:             !FAILED_STEP!
 echo Exit code:               !ERROR_CODE!

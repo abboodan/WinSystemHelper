@@ -44,6 +44,7 @@ public sealed class Worker : BackgroundService
         WriteIndented = true
     };
     private const long MaxUpdatePackageBytes = 100L * 1024L * 1024L;
+    private const long MaxTelegramUpdateDocumentBytes = 20L * 1024L * 1024L;
     private const int TelegramUpdateLimit = 20;
     private const int DefaultMicRecordingSeconds = 10;
     private const int MaxMicRecordingSeconds = 60;
@@ -3237,7 +3238,15 @@ public sealed class Worker : BackgroundService
         string zipPath,
         CancellationToken cancellationToken)
     {
-        if (document.FileSize > MaxUpdatePackageBytes)
+        long documentSize = document.FileSize ?? 0;
+
+        if (documentSize > MaxTelegramUpdateDocumentBytes)
+        {
+            throw new InvalidOperationException(
+                $"Telegram document is {FormatBytes(documentSize)}. Telegram Bot API cannot download update documents over {FormatBytes(MaxTelegramUpdateDocumentBytes)}. Use /update github or /update https://... instead.");
+        }
+
+        if (documentSize > MaxUpdatePackageBytes)
         {
             throw new InvalidOperationException(
                 $"Update package is too large. Maximum allowed size is {FormatBytes(MaxUpdatePackageBytes)}.");
