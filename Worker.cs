@@ -2821,6 +2821,7 @@ public sealed class Worker : BackgroundService
         string? zipPath = null;
         string updateStage = "initializing update";
         var updaterLaunched = false;
+        var updateProgressMessageSent = false;
 
         try
         {
@@ -2869,6 +2870,10 @@ public sealed class Worker : BackgroundService
                     GitHubReleaseInfo release = await GetLatestGitHubReleaseInfoAsync(cancellationToken);
                     updateUri = release.AssetDownloadUri;
                     updateStage = $"downloading GitHub Release '{release.TagName}' asset '{release.AssetName}'";
+                    await SendTelegramMessageOnceAsync(
+                        $"⬇️ GitHub update download started: {release.TagName} / {release.AssetName}",
+                        cancellationToken);
+                    updateProgressMessageSent = true;
                 }
                 else if (!TryParseUpdateUri(urlText, out updateUri, out string? uriError))
                 {
@@ -2877,7 +2882,11 @@ public sealed class Worker : BackgroundService
                 }
 
                 updateStage = $"downloading update URL '{updateUri}'";
-                await DownloadUrlUpdatePackageAsync(updateUri!, zipPath, cancellationToken);
+                await DownloadUrlUpdatePackageAsync(
+                    updateUri!,
+                    zipPath,
+                    updateProgressMessageSent,
+                    cancellationToken);
             }
 
             updateStage = "extracting update package";
@@ -3271,6 +3280,7 @@ public sealed class Worker : BackgroundService
     private async Task DownloadUrlUpdatePackageAsync(
         Uri updateUri,
         string zipPath,
+        bool sendProgress,
         CancellationToken cancellationToken)
     {
         using CancellationTokenSource timeout =
@@ -3295,7 +3305,22 @@ public sealed class Worker : BackgroundService
 
         await using Stream source = await response.Content.ReadAsStreamAsync(timeout.Token);
         await using FileStream destination = File.Create(zipPath);
-        await CopyStreamWithLimitAsync(source, destination, MaxUpdatePackageBytes, timeout.Token);
+        Func<int, CancellationToken, Task>? progressCallback = sendProgress
+            ? async (percent, token) =>
+            {
+                await SendTelegramMessageOnceAsync(
+                    $"⬇️ GitHub update download progress: {percent}%",
+                    token);
+            }
+            : null;
+
+        await CopyStreamWithLimitAsync(
+            source,
+            destination,
+            MaxUpdatePackageBytes,
+            contentLength,
+            progressCallback,
+            timeout.Token);
 
         EnsureFileWithinUpdateSizeLimit(zipPath);
     }
@@ -3304,16 +3329,24 @@ public sealed class Worker : BackgroundService
         Stream source,
         Stream destination,
         long maxBytes,
+        long? totalBytesHint,
+        Func<int, CancellationToken, Task>? progressCallback,
         CancellationToken cancellationToken)
     {
         byte[] buffer = new byte[81920];
         long totalBytes = 0;
+        int nextProgressPercent = 10;
 
         while (true)
         {
             int bytesRead = await source.ReadAsync(buffer, cancellationToken);
             if (bytesRead == 0)
             {
+                if (progressCallback is not null)
+                {
+                    await progressCallback(100, cancellationToken);
+                }
+
                 return;
             }
 
@@ -3325,6 +3358,20 @@ public sealed class Worker : BackgroundService
             }
 
             await destination.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+
+            if (progressCallback is not null && totalBytesHint is > 0)
+            {
+                int percent = (int)Math.Clamp(totalBytes * 100 / totalBytesHint.Value, 0, 100);
+                if (percent >= nextProgressPercent && percent < 100)
+                {
+                    await progressCallback(percent, cancellationToken);
+                    nextProgressPercent = Math.Min(90, ((percent / 10) + 1) * 10);
+                    if (nextProgressPercent <= percent)
+                    {
+                        nextProgressPercent = Math.Min(90, percent + 10);
+                    }
+                }
+            }
         }
     }
 
@@ -4786,6 +4833,18 @@ public sealed class Worker : BackgroundService
     private static string NormalizeReleaseVersion(string version)
     {
         string normalized = version.Trim();
+        int metadataIndex = normalized.IndexOf('+');
+        if (metadataIndex >= 0)
+        {
+            normalized = normalized[..metadataIndex];
+        }
+
+        int prereleaseIndex = normalized.IndexOf('-');
+        if (prereleaseIndex >= 0)
+        {
+            normalized = normalized[..prereleaseIndex];
+        }
+
         return normalized.StartsWith("v", StringComparison.OrdinalIgnoreCase)
             ? normalized[1..]
             : normalized;
