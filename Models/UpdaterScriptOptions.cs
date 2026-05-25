@@ -6,6 +6,7 @@ internal readonly record struct UpdaterScriptOptions(
     string PayloadRoot,
     string TargetDirectory,
     string BackupDirectory,
+    string PersistentBackupDirectory,
     string UpdateRoot,
     string StatusMarkerPath,
     string LogPath);

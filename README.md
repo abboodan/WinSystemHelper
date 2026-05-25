@@ -68,6 +68,10 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/config admin add\|remove [ChatId]` | Adds or removes Telegram admins without reinstalling. |
 | `/update [https-url]` | Applies an OTA update from an attached ZIP document or HTTPS ZIP URL. |
 | `/update github` | Downloads and applies the latest GitHub Release OTA package. |
+| `/restartself` | Requests confirmation before restarting the WinSystemHelper service. |
+| `/repair` | Runs diagnostics, safe repairs, command-menu registration, and temp cleanup. |
+| `/reinstall` | Requests confirmation before recreating the Windows Service from the current executable. |
+| `/rollback` | Requests confirmation before restoring the previous persistent OTA backup. |
 | `/help` | Shows the available remote commands. |
 | `/stop` | Requests confirmation before stopping the WinSystemHelper service. |
 | `/uninstall` | Requests confirmation before stopping and deleting the WinSystemHelper service. |
@@ -108,7 +112,7 @@ The project uses semantic versioning in `WinSystemHelper.csproj`. Each functiona
 - Minor: new commands, configuration options, alerts, or remote-management features.
 - Major: breaking configuration changes or behavior changes that require operator action.
 
-Current version: `1.5.7`.
+Current version: `1.5.8`.
 
 ## Installation
 
@@ -264,7 +268,20 @@ The ZIP may contain the published files directly at its root or inside one top-l
 
 Telegram document updates are intended for small packages only. If the ZIP is larger than the Telegram Bot API download limit, use `/update github` or `/update https://...` instead of attaching the file in Telegram.
 
-Updates use the existing admin chat allowlist as the trust boundary. The updater creates a backup before copying files and attempts rollback if the copy fails.
+Updates use the existing admin chat allowlist as the trust boundary. The updater creates a temporary backup before copying files and refreshes a persistent `Backups\previous` copy that `/rollback` can use later. If an update copy fails, the updater still attempts immediate rollback from the temporary backup.
+
+## Maintenance
+
+WinSystemHelper includes admin-only maintenance commands for service recovery:
+
+```text
+/repair
+/restartself
+/reinstall
+/rollback
+```
+
+`/repair` is non-destructive: it validates configuration, service path, runtime availability, shared folders, Telegram command menu registration, and cleans old temporary maintenance/update artifacts. `/restartself`, `/reinstall`, and `/rollback` require confirmation and run through detached maintenance scripts so the service can stop itself safely and report the result on startup.
 
 ### GitHub Releases
 
@@ -275,8 +292,8 @@ The build script includes size guardrails so CI fails instead of publishing a la
 Create a release by pushing a tag:
 
 ```powershell
-git tag v1.5.7
-git push origin v1.5.7
+git tag v1.5.8
+git push origin v1.5.8
 ```
 
 For public repositories, `/update github` reads:

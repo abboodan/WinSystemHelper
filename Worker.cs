@@ -60,6 +60,7 @@ public sealed class Worker : BackgroundService
     private const string ZipExtension = ".zip";
     private const string UpdateStatusMarkerFileName = ServiceConstants.UpdateStatusMarkerFileName;
     private const string MicLoopStateFileName = ServiceConstants.MicLoopStateFileName;
+    private const string PersistentBackupFolderName = "previous";
     private const string WakeEventLogName = "System";
     private const string WakeEventLogQuery =
         "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]";
@@ -1072,6 +1073,30 @@ public sealed class Worker : BackgroundService
                 case "/update":
                     await HandleUpdateCommandRequestAsync(message, text, chatId, cancellationToken);
                     break;
+                case "/restartself":
+                    await RequestDangerousConfirmationAsync(
+                        "restartself",
+                        "Restart the WinSystemHelper service",
+                        RestartSelfAsync,
+                        cancellationToken);
+                    break;
+                case "/repair":
+                    await RepairAsync(cancellationToken);
+                    break;
+                case "/reinstall":
+                    await RequestDangerousConfirmationAsync(
+                        "reinstall",
+                        "Reinstall the WinSystemHelper Windows Service",
+                        ReinstallSelfAsync,
+                        cancellationToken);
+                    break;
+                case "/rollback":
+                    await RequestDangerousConfirmationAsync(
+                        "rollback",
+                        "Rollback WinSystemHelper to the previous installed version",
+                        RollbackSelfAsync,
+                        cancellationToken);
+                    break;
                 case "/stop":
                     await RequestDangerousConfirmationAsync(
                         "stop",
@@ -1373,6 +1398,12 @@ public sealed class Worker : BackgroundService
             "🔄 Service & Updates",
             "/update [https-url] - 🔄 Apply an OTA update from a ZIP file or attached document.",
             "/update github - 🔄 Apply the latest GitHub Release OTA package.",
+            "",
+            "🛠️ Maintenance",
+            "/restartself - Restart the WinSystemHelper service.",
+            "/repair - Run diagnostics and safe repairs.",
+            "/reinstall - Recreate the Windows Service from the current executable.",
+            "/rollback - Restore the previous installed version.",
             "/stop - Request WinSystemHelper service stop.",
             "/uninstall - Request service uninstall.",
             "/help - Show this command list.");
@@ -1389,7 +1420,8 @@ public sealed class Worker : BackgroundService
             new[]
             {
                 new KeyboardButton[] { "/ping", "/help" },
-                new KeyboardButton[] { "/config", "/update" }
+                new KeyboardButton[] { "/config", "/update" },
+                new KeyboardButton[] { "/repair", "/restartself" }
             })
         {
             ResizeKeyboard = true,
@@ -2831,6 +2863,7 @@ public sealed class Worker : BackgroundService
             updateRoot = Path.Combine(updatesRoot, updateId);
             string extractRoot = Path.Combine(updateRoot, "Extracted");
             string backupDirectory = Path.Combine(updateRoot, "Backup");
+            string persistentBackupDirectory = GetPersistentBackupDirectory();
             zipPath = Path.Combine(updateRoot, "package.zip");
             string logPath = Path.Combine(updateRoot, "update.log");
             string statusMarkerPath = GetUpdateStatusMarkerPath();
@@ -2904,6 +2937,7 @@ public sealed class Worker : BackgroundService
                 payloadRoot,
                 AppContext.BaseDirectory,
                 backupDirectory,
+                persistentBackupDirectory,
                 updateRoot,
                 statusMarkerPath,
                 logPath);
@@ -2943,6 +2977,219 @@ public sealed class Worker : BackgroundService
 
             _updateLock.Release();
         }
+    }
+
+    private async Task RestartSelfAsync(CancellationToken cancellationToken)
+    {
+        string scriptPath = Path.Combine(
+            GetSharedTempDirectory("Maintenance"),
+            $"WinSystemHelper-restartself-{Guid.NewGuid():N}.ps1");
+        string logPath = Path.Combine(GetSharedTempDirectory("Maintenance"), "restartself.log");
+
+        string script = BuildRestartSelfScript(
+            ServiceName,
+            Environment.ProcessId,
+            GetUpdateStatusMarkerPath(),
+            logPath);
+
+        await File.WriteAllTextAsync(
+            scriptPath,
+            script,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            cancellationToken);
+
+        await SendTelegramMessageOnceAsync(
+            "🔄 Restarting WinSystemHelper service...",
+            cancellationToken);
+
+        LaunchUpdaterScript(scriptPath);
+        _hostLifetime.StopApplication();
+    }
+
+    private async Task ReinstallSelfAsync(CancellationToken cancellationToken)
+    {
+        string configPath = Path.Combine(AppContext.BaseDirectory, ConfigFileName);
+        if (!File.Exists(configPath))
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Reinstall blocked: {ConfigFileName} is missing beside the service executable.",
+                cancellationToken);
+            return;
+        }
+
+        string executablePath;
+        try
+        {
+            executablePath = Path.GetFullPath(GetCurrentExecutablePath());
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Reinstall blocked: unable to resolve executable path. {ex.Message}",
+                cancellationToken);
+            return;
+        }
+
+        if (IsBuildOutputDirectory(AppContext.BaseDirectory))
+        {
+            await SendTelegramMessageOnceAsync(
+                "⚠️ Reinstall blocked: service is running from a build/debug folder. Install from a clean deployment folder first.",
+                cancellationToken);
+            return;
+        }
+
+        string scriptPath = Path.Combine(
+            GetSharedTempDirectory("Maintenance"),
+            $"WinSystemHelper-reinstall-{Guid.NewGuid():N}.ps1");
+        string logPath = Path.Combine(GetSharedTempDirectory("Maintenance"), "reinstall.log");
+
+        string script = BuildReinstallSelfScript(
+            ServiceName,
+            Environment.ProcessId,
+            executablePath,
+            GetUpdateStatusMarkerPath(),
+            logPath);
+
+        await File.WriteAllTextAsync(
+            scriptPath,
+            script,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            cancellationToken);
+
+        await SendTelegramMessageOnceAsync(
+            "🛠️ Reinstalling WinSystemHelper Windows Service...",
+            cancellationToken);
+
+        LaunchUpdaterScript(scriptPath);
+        _hostLifetime.StopApplication();
+    }
+
+    private async Task RollbackSelfAsync(CancellationToken cancellationToken)
+    {
+        string persistentBackupDirectory = GetPersistentBackupDirectory();
+        string backupExecutable = Path.Combine(persistentBackupDirectory, Path.GetFileName(GetCurrentExecutablePath()));
+
+        if (IsBuildOutputDirectory(AppContext.BaseDirectory))
+        {
+            await SendTelegramMessageOnceAsync(
+                "⚠️ Rollback blocked: service is running from a build/debug folder.",
+                cancellationToken);
+            return;
+        }
+
+        if (!File.Exists(backupExecutable) || new FileInfo(backupExecutable).Length == 0)
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Rollback blocked: no valid persistent backup exists at {persistentBackupDirectory}. Run one successful OTA update first.",
+                cancellationToken);
+            return;
+        }
+
+        string configPath = Path.Combine(AppContext.BaseDirectory, ConfigFileName);
+        if (!File.Exists(configPath))
+        {
+            await SendTelegramMessageOnceAsync(
+                $"⚠️ Rollback blocked: {ConfigFileName} is missing beside the service executable.",
+                cancellationToken);
+            return;
+        }
+
+        string scriptPath = Path.Combine(
+            GetSharedTempDirectory("Maintenance"),
+            $"WinSystemHelper-rollback-{Guid.NewGuid():N}.ps1");
+        string logPath = Path.Combine(GetSharedTempDirectory("Maintenance"), "rollback.log");
+
+        string script = BuildRollbackSelfScript(
+            ServiceName,
+            Environment.ProcessId,
+            persistentBackupDirectory,
+            AppContext.BaseDirectory,
+            GetUpdateStatusMarkerPath(),
+            logPath);
+
+        await File.WriteAllTextAsync(
+            scriptPath,
+            script,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            cancellationToken);
+
+        await SendTelegramMessageOnceAsync(
+            "↩️ Rolling back WinSystemHelper to the previous installed version...",
+            cancellationToken);
+
+        LaunchUpdaterScript(scriptPath);
+        _hostLifetime.StopApplication();
+    }
+
+    private async Task RepairAsync(CancellationToken cancellationToken)
+    {
+        List<string> report = ["🛠️ WinSystemHelper repair report:"];
+
+        string configPath = Path.Combine(AppContext.BaseDirectory, ConfigFileName);
+        report.Add(File.Exists(configPath)
+            ? $"✅ Config exists: {configPath}"
+            : $"⚠️ Config missing: {configPath}");
+
+        try
+        {
+            string json = await File.ReadAllTextAsync(configPath, cancellationToken);
+            AppConfiguration? configuration =
+                JsonSerializer.Deserialize<AppConfiguration>(json, ConfigurationJsonOptions);
+            int adminCount = configuration?.GetEffectiveAdminChatIds().Count ?? 0;
+            report.Add(configuration is not null && !string.IsNullOrWhiteSpace(configuration.BotToken) && adminCount > 0
+                ? $"✅ Config readable: {adminCount} admin(s)"
+                : "⚠️ Config readable but missing BotToken/AdminChatIds");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            report.Add($"⚠️ Config read failed: {ex.Message}");
+        }
+
+        try
+        {
+            string currentExecutablePath = Path.GetFullPath(GetCurrentExecutablePath());
+            string? serviceExecutablePath = await GetConfiguredServiceExecutablePathAsync(cancellationToken);
+            report.Add(string.IsNullOrWhiteSpace(serviceExecutablePath)
+                ? "⚠️ Service path unavailable from sc.exe"
+                : PathsEqual(currentExecutablePath, serviceExecutablePath)
+                    ? "✅ Service binPath matches running executable"
+                    : $"⚠️ Service binPath mismatch: {serviceExecutablePath}");
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or System.TimeoutException)
+        {
+            report.Add($"⚠️ Service path check failed: {ex.Message}");
+        }
+
+        report.Add(IsBuildOutputDirectory(AppContext.BaseDirectory)
+            ? "⚠️ Running from build/debug output folder"
+            : "✅ Running from deployment folder");
+
+        report.Add(await HasDotNet8RuntimeAsync(cancellationToken)
+            ? "✅ .NET 8 Runtime detected"
+            : "⚠️ .NET 8 Runtime not detected");
+
+        string[] repairFolders =
+            ["Updates", "Backups", "Audio", "Screen", "Camera", "Interaction", "PowerEvents", "Maintenance"];
+        foreach (string purpose in repairFolders)
+        {
+            string directory = GetSharedTempDirectory(purpose);
+            report.Add($"✅ Shared folder ready: {purpose}");
+            int deleted = CleanupOldSharedTempItems(directory, TimeSpan.FromDays(2));
+            if (deleted > 0)
+            {
+                report.Add($"🧹 Cleaned {deleted} old item(s) from {purpose}");
+            }
+        }
+
+        await _telegramMenuService.RegisterAsync(
+            GetAdminChatIdsSnapshot(),
+            TelegramSendTimeout,
+            cancellationToken);
+        report.Add("✅ Telegram command menu registration requested");
+
+        await SendTelegramMessageOnceAsync(
+            TruncateForTelegram(string.Join(Environment.NewLine, report), 3900),
+            cancellationToken);
     }
 
     private async Task<string?> ValidateOtaPreflightAsync(CancellationToken cancellationToken)
@@ -4510,6 +4757,7 @@ public sealed class Worker : BackgroundService
         string encodedPayloadRoot = EncodeUtf8Base64(options.PayloadRoot);
         string encodedTargetDirectory = EncodeUtf8Base64(options.TargetDirectory);
         string encodedBackupDirectory = EncodeUtf8Base64(options.BackupDirectory);
+        string encodedPersistentBackupDirectory = EncodeUtf8Base64(options.PersistentBackupDirectory);
         string encodedUpdateRoot = EncodeUtf8Base64(options.UpdateRoot);
         string encodedStatusMarkerPath = EncodeUtf8Base64(options.StatusMarkerPath);
         string encodedLogPath = EncodeUtf8Base64(options.LogPath);
@@ -4526,6 +4774,7 @@ public sealed class Worker : BackgroundService
             $PayloadRoot = Decode-Base64Utf8 '{{encodedPayloadRoot}}'
             $TargetDirectory = Decode-Base64Utf8 '{{encodedTargetDirectory}}'
             $BackupDirectory = Decode-Base64Utf8 '{{encodedBackupDirectory}}'
+            $PersistentBackupDirectory = Decode-Base64Utf8 '{{encodedPersistentBackupDirectory}}'
             $UpdateRoot = Decode-Base64Utf8 '{{encodedUpdateRoot}}'
             $StatusMarkerPath = Decode-Base64Utf8 '{{encodedStatusMarkerPath}}'
             $LogPath = Decode-Base64Utf8 '{{encodedLogPath}}'
@@ -4653,6 +4902,13 @@ public sealed class Worker : BackgroundService
                 Write-Log "Backing up current service files."
                 Copy-Tree -source $TargetDirectory -destination $BackupDirectory
 
+                Write-Log "Refreshing persistent rollback backup."
+                if (Test-Path -LiteralPath $PersistentBackupDirectory) {
+                    Remove-Item -LiteralPath $PersistentBackupDirectory -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                New-Item -ItemType Directory -Path $PersistentBackupDirectory -Force | Out-Null
+                Copy-Tree -source $BackupDirectory -destination $PersistentBackupDirectory
+
                 Write-Log "Copying staged update files."
                 Copy-Tree -source $PayloadRoot -destination $TargetDirectory
 
@@ -4711,6 +4967,201 @@ public sealed class Worker : BackgroundService
     private static string EncodeUtf8Base64(string value)
     {
         return Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
+    }
+
+    private static string BuildRestartSelfScript(
+        string serviceName,
+        int processId,
+        string statusMarkerPath,
+        string logPath)
+    {
+        return BuildServiceMaintenanceScript(
+            "restart",
+            serviceName,
+            processId,
+            executablePath: null,
+            sourceDirectory: null,
+            targetDirectory: null,
+            statusMarkerPath,
+            logPath);
+    }
+
+    private static string BuildReinstallSelfScript(
+        string serviceName,
+        int processId,
+        string executablePath,
+        string statusMarkerPath,
+        string logPath)
+    {
+        return BuildServiceMaintenanceScript(
+            "reinstall",
+            serviceName,
+            processId,
+            executablePath,
+            sourceDirectory: null,
+            targetDirectory: null,
+            statusMarkerPath,
+            logPath);
+    }
+
+    private static string BuildRollbackSelfScript(
+        string serviceName,
+        int processId,
+        string backupDirectory,
+        string targetDirectory,
+        string statusMarkerPath,
+        string logPath)
+    {
+        return BuildServiceMaintenanceScript(
+            "rollback",
+            serviceName,
+            processId,
+            executablePath: null,
+            backupDirectory,
+            targetDirectory,
+            statusMarkerPath,
+            logPath);
+    }
+
+    private static string BuildServiceMaintenanceScript(
+        string mode,
+        string serviceName,
+        int processId,
+        string? executablePath,
+        string? sourceDirectory,
+        string? targetDirectory,
+        string statusMarkerPath,
+        string logPath)
+    {
+        string encodedMode = EncodeUtf8Base64(mode);
+        string encodedServiceName = EncodeUtf8Base64(serviceName);
+        string encodedExecutablePath = EncodeUtf8Base64(executablePath ?? string.Empty);
+        string encodedSourceDirectory = EncodeUtf8Base64(sourceDirectory ?? string.Empty);
+        string encodedTargetDirectory = EncodeUtf8Base64(targetDirectory ?? string.Empty);
+        string encodedStatusMarkerPath = EncodeUtf8Base64(statusMarkerPath);
+        string encodedLogPath = EncodeUtf8Base64(logPath);
+
+        return $$"""
+            $ErrorActionPreference = 'Stop'
+            function Decode-Base64Utf8([string]$value) { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($value)) }
+            $Mode = Decode-Base64Utf8 '{{encodedMode}}'
+            $ServiceName = Decode-Base64Utf8 '{{encodedServiceName}}'
+            $TargetProcessId = {{processId}}
+            $ExecutablePath = Decode-Base64Utf8 '{{encodedExecutablePath}}'
+            $SourceDirectory = Decode-Base64Utf8 '{{encodedSourceDirectory}}'
+            $TargetDirectory = Decode-Base64Utf8 '{{encodedTargetDirectory}}'
+            $StatusMarkerPath = Decode-Base64Utf8 '{{encodedStatusMarkerPath}}'
+            $LogPath = Decode-Base64Utf8 '{{encodedLogPath}}'
+            $ConfigFileName = '{{ConfigFileName}}'
+            $PathTrimChars = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+
+            function Write-Log([string]$message) {
+                $logDirectory = [System.IO.Path]::GetDirectoryName($LogPath)
+                if (-not [string]::IsNullOrWhiteSpace($logDirectory)) { New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null }
+                Add-Content -LiteralPath $LogPath -Value "$(Get-Date -Format o) $message" -Encoding UTF8
+            }
+
+            function Write-Status([string]$message) {
+                $statusDirectory = [System.IO.Path]::GetDirectoryName($StatusMarkerPath)
+                if (-not [string]::IsNullOrWhiteSpace($statusDirectory)) { New-Item -ItemType Directory -Path $statusDirectory -Force | Out-Null }
+                Set-Content -LiteralPath $StatusMarkerPath -Value $message -Encoding UTF8
+            }
+
+            function Invoke-Sc([string[]]$arguments, [string]$description, [int[]]$allowedExitCodes = @(0)) {
+                $output = & sc.exe @arguments 2>&1
+                $exitCode = $LASTEXITCODE
+                Write-Log "$description exit=$exitCode output=$($output -join ' ')"
+                if ($allowedExitCodes -notcontains $exitCode) { throw "$description failed with exit code $exitCode. Output: $($output -join ' ')" }
+            }
+
+            function Invoke-Retry([scriptblock]$action, [string]$description) {
+                $lastError = $null
+                for ($attempt = 1; $attempt -le 30; $attempt++) {
+                    try { & $action; return }
+                    catch {
+                        $lastError = $_
+                        Write-Log "$description failed on attempt ${attempt}: $($_.Exception.Message)"
+                        if ($attempt -lt 30) { Start-Sleep -Seconds 2 }
+                    }
+                }
+                throw "Failed to complete '$description'. Last error: $($lastError.Exception.Message)"
+            }
+
+            function Copy-Tree([string]$source, [string]$destination) {
+                if (-not (Test-Path -LiteralPath $source)) { throw "Source path does not exist: $source" }
+                New-Item -ItemType Directory -Path $destination -Force | Out-Null
+                Get-ChildItem -LiteralPath $source -Recurse -Directory -Force | ForEach-Object {
+                    $relative = $_.FullName.Substring($source.Length).TrimStart($PathTrimChars)
+                    if (-not [string]::IsNullOrWhiteSpace($relative)) {
+                        New-Item -ItemType Directory -Path (Join-Path $destination $relative) -Force | Out-Null
+                    }
+                }
+                Get-ChildItem -LiteralPath $source -Recurse -File -Force | Where-Object {
+                    -not $_.Name.Equals($ConfigFileName, [System.StringComparison]::OrdinalIgnoreCase)
+                } | ForEach-Object {
+                    $file = $_
+                    $relative = $file.FullName.Substring($source.Length).TrimStart($PathTrimChars)
+                    $targetPath = Join-Path $destination $relative
+                    $targetParent = [System.IO.Path]::GetDirectoryName($targetPath)
+                    if (-not [string]::IsNullOrWhiteSpace($targetParent)) { New-Item -ItemType Directory -Path $targetParent -Force | Out-Null }
+                    Invoke-Retry { Copy-Item -LiteralPath $file.FullName -Destination $targetPath -Force } "copy $relative"
+                }
+            }
+
+            function Wait-ForCurrentServiceProcessExit {
+                Start-Sleep -Seconds 3
+                Invoke-Sc -arguments @('stop', $ServiceName) -description 'sc stop' -allowedExitCodes @(0,1060,1062)
+                $deadline = (Get-Date).AddSeconds(90)
+                while ((Get-Process -Id $TargetProcessId -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+            }
+
+            function Start-TargetService {
+                Invoke-Sc -arguments @('start', $ServiceName) -description 'sc start' -allowedExitCodes @(0,1056)
+                $deadline = (Get-Date).AddSeconds(30)
+                do {
+                    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+                    if ($null -ne $service -and $service.Status -eq 'Running') { return }
+                    Start-Sleep -Seconds 1
+                } while ((Get-Date) -lt $deadline)
+                throw "Service did not reach RUNNING state."
+            }
+
+            try {
+                Write-Log "Maintenance script started. Mode=$Mode"
+                if ($Mode -eq 'reinstall') {
+                    Wait-ForCurrentServiceProcessExit
+                    Invoke-Sc -arguments @('delete', $ServiceName) -description 'sc delete' -allowedExitCodes @(0,1060)
+                    Start-Sleep -Seconds 3
+                    Invoke-Sc -arguments @('create', $ServiceName, "binPath= `"$ExecutablePath`"", 'start= auto') -description 'sc create'
+                    Invoke-Sc -arguments @('description', $ServiceName, 'Hybrid .NET 8 Windows Service for remote device management via Telegram.') -description 'sc description' -allowedExitCodes @(0)
+                    Start-TargetService
+                    Write-Status "✅ WinSystemHelper service reinstalled successfully at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')."
+                }
+                elseif ($Mode -eq 'rollback') {
+                    Wait-ForCurrentServiceProcessExit
+                    Copy-Tree -source $SourceDirectory -destination $TargetDirectory
+                    Start-TargetService
+                    Write-Status "✅ WinSystemHelper rollback completed successfully at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')."
+                }
+                else {
+                    Wait-ForCurrentServiceProcessExit
+                    Start-TargetService
+                    Write-Status "✅ WinSystemHelper service restarted successfully at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')."
+                }
+            }
+            catch {
+                Write-Log "Maintenance failed: $($_.Exception.Message)"
+                Write-Status "⚠️ WinSystemHelper maintenance '$Mode' failed at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'). Error: $($_.Exception.Message)"
+            }
+            finally {
+                $scriptPath = $MyInvocation.MyCommand.Path
+                $escapedScriptPath = $scriptPath.Replace("'", "''")
+                $cleanupScript = "Start-Sleep -Seconds 5; Remove-Item -LiteralPath '$escapedScriptPath' -Force -ErrorAction SilentlyContinue"
+                $cleanupBytes = [System.Text.Encoding]::Unicode.GetBytes($cleanupScript)
+                $cleanupEncoded = [System.Convert]::ToBase64String($cleanupBytes)
+                Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $cleanupEncoded" -WindowStyle Hidden
+            }
+            """;
     }
 
     private static string TruncateForTelegram(string value, int maxLength)
@@ -4940,6 +5391,11 @@ public sealed class Worker : BackgroundService
     private string GetUpdateStatusMarkerPath()
     {
         return Path.Combine(GetSharedTempDirectory("Updates"), UpdateStatusMarkerFileName);
+    }
+
+    private string GetPersistentBackupDirectory()
+    {
+        return Path.Combine(GetSharedTempDirectory("Backups"), PersistentBackupFolderName);
     }
 
     private static string NormalizeProcessName(string processName)
@@ -5396,6 +5852,63 @@ public sealed class Worker : BackgroundService
         {
             _logger.LogWarning(ex, "Failed to delete temporary directory {Directory}.", directory);
         }
+    }
+
+    private int CleanupOldSharedTempItems(string directory, TimeSpan maxAge)
+    {
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+        {
+            return 0;
+        }
+
+        int deleted = 0;
+        DateTime cutoffUtc = DateTime.UtcNow.Subtract(maxAge);
+
+        foreach (string childDirectory in Directory.EnumerateDirectories(directory))
+        {
+            try
+            {
+                if (Path.GetFileName(childDirectory).Equals(PersistentBackupFolderName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                DirectoryInfo info = new(childDirectory);
+                if (info.LastWriteTimeUtc < cutoffUtc)
+                {
+                    info.Delete(recursive: true);
+                    deleted++;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+            {
+                _logger.LogDebug(ex, "Failed to clean old directory {Directory}.", childDirectory);
+            }
+        }
+
+        foreach (string file in Directory.EnumerateFiles(directory))
+        {
+            try
+            {
+                if (Path.GetFileName(file).Equals(UpdateStatusMarkerFileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                FileInfo info = new(file);
+                if (info.LastWriteTimeUtc < cutoffUtc)
+                {
+                    info.Delete();
+                    deleted++;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+            {
+                _logger.LogDebug(ex, "Failed to clean old file {File}.", file);
+            }
+        }
+
+        return deleted;
     }
 
     private async Task RunMicRecorderHelperAsync(

@@ -96,6 +96,10 @@ public sealed class TelegramMenuService
             new BotCommand { Command = "service", Description = "Manage a Windows service" },
             new BotCommand { Command = "config", Description = "Manage runtime configuration" },
             new BotCommand { Command = "update", Description = "Apply an OTA update" },
+            new BotCommand { Command = "restartself", Description = "Restart WinSystemHelper service" },
+            new BotCommand { Command = "repair", Description = "Run maintenance diagnostics" },
+            new BotCommand { Command = "reinstall", Description = "Recreate WinSystemHelper service" },
+            new BotCommand { Command = "rollback", Description = "Restore previous version" },
             new BotCommand { Command = "help", Description = "Show available commands" },
             new BotCommand { Command = "stop", Description = "Stop the service" },
             new BotCommand { Command = "uninstall", Description = "Stop and delete the service" }
