@@ -125,7 +125,9 @@ Run PowerShell or Command Prompt as Administrator, then install the service with
 .\WinSystemHelper.Bootstrapper.exe /install /token <YOUR_TOKEN> /chatid <YOUR_CHAT_ID>
 ```
 
-The bootstrapper installs missing runtime prerequisites, preserves the existing silent install flow, writes `config.json` next to the executable using the multi-admin format, creates the `WinSystemHelper` Windows Service, and starts it automatically.
+The bootstrapper installs missing runtime prerequisites, then the installer copies the application to `%ProgramFiles%\WinSystemHelper`, writes `config.json` there using the multi-admin format, creates the `WinSystemHelper` Windows Service with a quoted executable path, and starts it automatically. The folder you launched the installer from is no longer used and can be deleted.
+
+The service runs as LocalSystem, so it must not live in a folder ordinary users can modify. A copy that is already somewhere under `%ProgramFiles%` is installed in place; anything else is relocated. `/repair` reports an install folder that non-administrators can write to.
 
 If the native bootstrapper is unavailable, use the PowerShell fallback from the same folder:
 
@@ -172,7 +174,13 @@ Runtime credentials are stored in:
 config.json
 ```
 
+It sits in the install folder and holds the bot token in clear text, so it is written with an access list limited to SYSTEM and Administrators (existing installs are tightened on the next service start). Installer logs never record command-line values.
+
 This file is intentionally excluded from Git. Do not commit bot tokens, chat IDs, appsettings files, logs, or local build output.
+
+### Who can send commands
+
+A command is accepted only when **both** the chat and the person who sent it are in `adminChatIds`. In a private chat those are the same number. If you list a group, also list the user ID of each person allowed to control the machine; other group members and anonymous group admins are ignored. Alerts are still delivered to every listed chat.
 
 The current configuration format supports multiple Telegram admins:
 
@@ -308,7 +316,25 @@ The ZIP may contain the published files directly at its root or inside one top-l
 
 Telegram document updates are intended for small packages only. If the ZIP is larger than the Telegram Bot API download limit, use `/update github` or `/update https://...` instead of attaching the file in Telegram.
 
-Updates use the existing admin chat allowlist as the trust boundary. The updater creates a temporary backup before copying files and refreshes a persistent `Backups\previous` copy that `/rollback` can use later. If an update copy fails, the updater still attempts immediate rollback from the temporary backup.
+### Signed updates
+
+An update is code that runs as LocalSystem, so being able to send a command should not be enough to install one. Release packages carry a detached ECDSA P-256 signature (`WinSystemHelper-ota.zip.sig`), and a build with a pinned public key refuses any package without a valid signature, before anything is extracted:
+
+- `/update github` reads the `.sig` asset from the same Release.
+- `/update https://host/file.zip` fetches `https://host/file.zip.sig`.
+- A ZIP attached in Telegram takes the signature in the caption: `/update <signature>`.
+
+One-time setup for maintainers (and for forks, which need their own key):
+
+```powershell
+.\WinSystemHelper.exe /ota-keygen C:\secure\ota-signing.key
+```
+
+Store the file's content as the GitHub Actions secret `OTA_SIGNING_KEY`, keep the file out of the repository, and set `OtaSignature.PinnedPublicKey` in `Updates/OtaSignature.cs` to the printed public key. From then on the release workflow signs the package and fails if the signature does not match the key compiled into the build.
+
+Until a key is pinned, the build cannot verify packages: it still accepts updates, says so in the update message and in `/repair`, and the release workflow prints a warning. Rotating the key requires shipping a release, signed with the old key, that pins the new one.
+
+Admin-chat authorization, confirmation, and cooldown still apply on top of the signature. The updater creates a temporary backup before copying files and refreshes a persistent `Backups\previous` copy that `/rollback` can use later. If an update copy fails, the updater still attempts immediate rollback from the temporary backup.
 
 ## Maintenance
 
@@ -355,6 +381,10 @@ Before stopping the service, `/update` verifies that the endpoint is safe to res
 - The ZIP must contain a non-empty `WinSystemHelper.exe` at the payload root and must not include `config.json`.
 
 If any check fails, the bot rejects the update with a clear warning and keeps the existing service running.
+
+## Service storage
+
+Updater and maintenance scripts, staged update payloads, the rollback backup, and pending power-event reports live under `%ProgramData%\WinSystemHelper\Service`, restricted to SYSTEM and Administrators. Earlier versions used `C:\Users\Public\Documents\WinSystemHelper`, which any local user can modify; nothing is executed or restored from that folder any more, and it can be deleted after upgrading. Because the old rollback backup is not trusted, `/rollback` becomes available again after the first update applied by this version.
 
 ## Security Disclaimer
 

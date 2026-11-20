@@ -13,6 +13,14 @@ public sealed class CommandExecution(int id, bool priority)
 
 public static class CommandPolicy
 {
+    /// <summary>
+    /// A command is accepted only when both the chat and the person who sent it are
+    /// configured administrators. Checking the chat alone would let every member of an
+    /// allowlisted group (and anonymous group admins) control the machine.
+    /// </summary>
+    public static bool IsAuthorizedSender(long chatId, long? senderId, IReadOnlyCollection<long> adminIds) =>
+        senderId is long sender && sender != 0 && adminIds.Contains(chatId) && adminIds.Contains(sender);
+
     public static bool IsReadOnly(string text)
     {
         string[] p = text.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries);

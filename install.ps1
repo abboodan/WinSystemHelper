@@ -69,7 +69,8 @@ function Install-DotNet8Runtime {
 }
 
 try {
-    Write-BootstrapLog "install.ps1 started. Args: $($RemainingArgs -join ' ')"
+    # Arguments carry the bot token and admin chat ID, so they are never logged.
+    Write-BootstrapLog "install.ps1 started. Command-line values are omitted for privacy."
 
     if (-not (Test-Path -LiteralPath $appPath)) {
         throw "WinSystemHelper.exe was not found beside install.ps1."

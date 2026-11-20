@@ -63,6 +63,26 @@ jobs:
           ./scripts/Check-PublishSafety.ps1 -Mode WorkingTree -Package $package
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Sign OTA package
+        shell: pwsh
+        env:
+          OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
+        run: |
+          $package = Join-Path $env:GITHUB_WORKSPACE "artifacts\WinSystemHelper-ota.zip"
+          if ($env:OTA_SIGNING_KEY) {
+            ./dist/WinSystemHelper.exe /ota-sign $package
+            if ($LASTEXITCODE -ne 0) { throw 'Signing the OTA package failed.' }
+          }
+          # The built executable is the judge: it checks the signature against the
+          # public key compiled into it, exactly as an installed service will.
+          ./dist/WinSystemHelper.exe /ota-verify $package
+          if ($LASTEXITCODE -eq 3) {
+            Write-Warning 'No release key is pinned in this build. The package is published UNSIGNED and installed services will not verify it.'
+          }
+          elseif ($LASTEXITCODE -ne 0) {
+            throw 'This build requires signed updates, but the package has no valid signature. Check the OTA_SIGNING_KEY secret against OtaSignature.PinnedPublicKey.'
+          }
+
       - name: Publish GitHub Release
         shell: pwsh
         env:
@@ -70,7 +90,9 @@ jobs:
         run: |
           $tag = "${{ github.ref_name }}"
           $package = Join-Path $env:GITHUB_WORKSPACE "artifacts\WinSystemHelper-ota.zip"
-          gh release create $tag $package `
+          $assets = @($package)
+          if (Test-Path -LiteralPath "$package.sig") { $assets += "$package.sig" }
+          gh release create $tag @assets `
             --repo "${{ github.repository }}" `
             --title "WinSystemHelper $tag" `
             --notes "Automated WinSystemHelper OTA release for $tag."

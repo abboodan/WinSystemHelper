@@ -59,6 +59,11 @@ public sealed class QueueStore : IDisposable
         if (!OperatingSystem.IsWindows()) return;
         var acl = new DirectorySecurity();
         acl.SetAccessRuleProtection(true, false);
+        // A folder pre-created by another account stays under that account's control
+        // unless ownership moves too. Only an elevated process is allowed to assign it.
+        using (WindowsIdentity current = WindowsIdentity.GetCurrent())
+            if (current.IsSystem || new WindowsPrincipal(current).IsInRole(WindowsBuiltInRole.Administrator))
+                acl.SetOwner(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null));
         var inheritance = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
         foreach (var sid in new[] { new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
             new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), WindowsIdentity.GetCurrent().User! })

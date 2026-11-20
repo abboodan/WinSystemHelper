@@ -23,6 +23,10 @@ async Task<int> RunAsync(string[] launchArgs)
             Console.WriteLine($"SQLite storage available: {command.ExecuteScalar()}");
             return 0;
         }
+        if (launchArgs.Length > 0 && launchArgs[0].StartsWith("/ota-", StringComparison.OrdinalIgnoreCase))
+        {
+            return RunOtaSigningTool(launchArgs);
+        }
         if (IsMicRecorderHelperMode(launchArgs))
         {
             return await RunMicRecorderHelperAsync(launchArgs);
@@ -58,6 +62,81 @@ async Task<int> RunAsync(string[] launchArgs)
     }
 }
 
+// Release tooling. The private key is only ever read from a file or environment
+// variable supplied by the maintainer; it is never printed or embedded.
+//   /ota-keygen <private-key-file>   create a signing key pair
+//   /ota-sign <package.zip>          write <package.zip>.sig using OTA_SIGNING_KEY
+//   /ota-verify <package.zip>        exit 0 = valid, 1 = invalid, 3 = build has no pinned key
+static int RunOtaSigningTool(string[] launchArgs)
+{
+    string mode = launchArgs[0].ToLowerInvariant();
+    if (launchArgs.Length != 2)
+    {
+        Console.Error.WriteLine("Usage: /ota-keygen <private-key-file> | /ota-sign <package.zip> | /ota-verify <package.zip>");
+        return 2;
+    }
+
+    string path = Path.GetFullPath(launchArgs[1]);
+    string signaturePath = path + OtaSignature.SignatureFileSuffix;
+
+    switch (mode)
+    {
+        case "/ota-keygen":
+        {
+            if (File.Exists(path))
+            {
+                Console.Error.WriteLine("Refusing to overwrite an existing key file.");
+                return 1;
+            }
+
+            (string privateKey, string publicKey) = OtaSignature.GenerateKeyPair();
+            using (new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+            }
+
+            ConfigurationFileService.RestrictAccess(path);
+            File.WriteAllText(path, privateKey);
+            Console.WriteLine($"Private key written to: {path}");
+            Console.WriteLine("Keep it out of the repository. Store its content as the GitHub Actions secret");
+            Console.WriteLine($"{OtaSignature.PrivateKeyEnvironmentVariable}, then delete or back up the file offline.");
+            Console.WriteLine();
+            Console.WriteLine("Public key (set OtaSignature.PinnedPublicKey to this value):");
+            Console.WriteLine(publicKey);
+            return 0;
+        }
+        case "/ota-sign":
+        {
+            string? privateKey = Environment.GetEnvironmentVariable(OtaSignature.PrivateKeyEnvironmentVariable);
+            if (string.IsNullOrWhiteSpace(privateKey))
+            {
+                Console.Error.WriteLine($"{OtaSignature.PrivateKeyEnvironmentVariable} is not set.");
+                return 1;
+            }
+
+            string signature = OtaSignature.Sign(path, privateKey);
+            File.WriteAllText(signaturePath, signature);
+            Console.WriteLine($"Signature written to: {signaturePath}");
+            return 0;
+        }
+        case "/ota-verify":
+        {
+            if (!OtaSignature.IsEnforced)
+            {
+                Console.WriteLine("This build has no pinned release key; packages are not verified.");
+                return 3;
+            }
+
+            bool valid = File.Exists(signaturePath) &&
+                OtaSignature.Verify(path, File.ReadAllText(signaturePath));
+            Console.WriteLine(valid ? "Signature valid." : "Signature missing or invalid.");
+            return valid ? 0 : 1;
+        }
+        default:
+            Console.Error.WriteLine("Unknown release tool command.");
+            return 2;
+    }
+}
+
 async Task<int> RunSilentCliModeAsync(string[] launchArgs)
 {
     CliOptions options = ParseArguments(launchArgs);
@@ -90,12 +169,11 @@ async Task<int> RunSilentCliModeAsync(string[] launchArgs)
         return 1;
     }
 
-    SaveConfiguration(new AppConfiguration
+    await InstallServiceAsync(new AppConfiguration
     {
         BotToken = options.BotToken.Trim(),
         AdminChatIds = [options.AdminChatId.Value]
-    });
-    await InstallServiceAsync(writeOutput: false);
+    }, writeOutput: false);
 
     return 0;
 }
@@ -104,7 +182,7 @@ async Task<int> RunFirstRunSetupWizardAsync()
 {
     Console.Title = ServiceName;
     Console.WriteLine("Welcome to WinSystemHelper Setup");
-    Console.WriteLine($"Configuration path: {configPath}");
+    Console.WriteLine($"Install folder: {InstallLayout.ResolveInstallDirectory(AppContext.BaseDirectory)}");
     Console.WriteLine();
 
     if (!EnsureAdministrator())
@@ -160,12 +238,11 @@ async Task<int> RunFirstRunSetupWizardAsync()
         adminChatIds.Add(additionalChatId);
     }
 
-    SaveConfiguration(new AppConfiguration
+    await InstallServiceAsync(new AppConfiguration
     {
         BotToken = botToken.Trim(),
         AdminChatIds = adminChatIds.ToArray()
-    });
-    await InstallServiceAsync(writeOutput: true);
+    }, writeOutput: true);
 
     return 0;
 }
@@ -202,14 +279,18 @@ async Task RunServiceModeAsync()
     await host.RunAsync();
 }
 
-async Task InstallServiceAsync(bool writeOutput)
+async Task InstallServiceAsync(AppConfiguration configuration, bool writeOutput)
 {
     if (!EnsureAdministrator())
     {
         return;
     }
 
-    string executablePath = GetExecutablePath();
+    // The service runs as LocalSystem, so it is installed where only administrators
+    // can replace its files, and the configuration is written with a restricted
+    // access list instead of inheriting the launch folder's permissions.
+    string installDirectory = InstallLayout.ResolveInstallDirectory(AppContext.BaseDirectory);
+    string executablePath = Path.Combine(installDirectory, Path.GetFileName(GetExecutablePath()));
 
     if (await IsServiceInstalledAsync())
     {
@@ -217,9 +298,21 @@ async Task InstallServiceAsync(bool writeOutput)
         await Task.Delay(TimeSpan.FromSeconds(1));
     }
 
-    ProcessResult create = await RunProcessAsync(
+    int copied = InstallLayout.CopyApplicationFiles(AppContext.BaseDirectory, installDirectory);
+    new ConfigurationFileService(installDirectory).Save(configuration);
+
+    if (writeOutput)
+    {
+        Console.WriteLine(copied > 0
+            ? $"Installed {copied} file(s) to {installDirectory}."
+            : $"Installing in place: {installDirectory}.");
+    }
+
+    // The path is stored quoted: an unquoted service path containing spaces lets
+    // Windows try other executables first (for example C:\Program.exe).
+    ProcessResult create = await RunProcessWithArgumentsAsync(
         "sc.exe",
-        $"create {ServiceName} binPath= \"{EscapeArgument(executablePath)}\" start= auto");
+        "create", ServiceName, "binPath=", $"\"{executablePath}\"", "start=", "auto");
 
     EnsureSuccess(create, "Failed to create Windows Service.");
 
@@ -265,11 +358,6 @@ async Task<bool> IsServiceInstalledAsync()
 {
     ProcessResult query = await RunProcessAsync("sc.exe", $"query {ServiceName}");
     return query.ExitCode == 0;
-}
-
-void SaveConfiguration(AppConfiguration configuration)
-{
-    configurationFileService.Save(configuration);
 }
 
 AppConfiguration LoadConfiguration()
@@ -478,23 +566,31 @@ static string GetExecutablePath()
         throw new InvalidOperationException("Unable to resolve executable path.");
 }
 
-static string EscapeArgument(string value)
+static Task<ProcessResult> RunProcessAsync(string fileName, string arguments)
 {
-    return value.Replace("\"", "\\\"", StringComparison.Ordinal);
+    return RunStartInfoAsync(new ProcessStartInfo(fileName, arguments));
 }
 
-static async Task<ProcessResult> RunProcessAsync(string fileName, string arguments)
+static Task<ProcessResult> RunProcessWithArgumentsAsync(string fileName, params string[] arguments)
 {
-    using Process process = new()
+    // ArgumentList quotes and escapes each value, including embedded quotes.
+    ProcessStartInfo startInfo = new(fileName);
+    foreach (string argument in arguments)
     {
-        StartInfo = new ProcessStartInfo(fileName, arguments)
-        {
-            CreateNoWindow = true,
-            RedirectStandardError = true,
-            RedirectStandardOutput = true,
-            UseShellExecute = false
-        }
-    };
+        startInfo.ArgumentList.Add(argument);
+    }
+
+    return RunStartInfoAsync(startInfo);
+}
+
+static async Task<ProcessResult> RunStartInfoAsync(ProcessStartInfo startInfo)
+{
+    startInfo.CreateNoWindow = true;
+    startInfo.RedirectStandardError = true;
+    startInfo.RedirectStandardOutput = true;
+    startInfo.UseShellExecute = false;
+
+    using Process process = new() { StartInfo = startInfo };
 
     process.Start();
 

@@ -12,6 +12,23 @@ var testRoot = Path.Combine(Path.GetTempPath(), "WinSystemHelper-queue-tests", G
 Directory.CreateDirectory(testRoot);
 int passed = 0;
 void Check(bool condition, string name) { if (!condition) throw new Exception("FAIL: " + name); Console.WriteLine("PASS: " + name); passed++; }
+bool OnlyTrustedAccess(string path)
+{
+    System.Security.AccessControl.FileSystemSecurity security = Directory.Exists(path)
+        ? new DirectoryInfo(path).GetAccessControl()
+        : new FileInfo(path).GetAccessControl();
+    using var current = System.Security.Principal.WindowsIdentity.GetCurrent();
+    var rules = security.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier));
+    if (!security.AreAccessRulesProtected || rules.Count == 0) return false;
+    foreach (System.Security.AccessControl.FileSystemAccessRule rule in rules)
+    {
+        var sid = (System.Security.Principal.SecurityIdentifier)rule.IdentityReference;
+        if (!sid.IsWellKnown(System.Security.Principal.WellKnownSidType.LocalSystemSid) &&
+            !sid.IsWellKnown(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid) &&
+            !sid.Equals(current.User!)) return false;
+    }
+    return true;
+}
 QueueStore Store(string name, Func<int>? limit = null) => new(Path.Combine(testRoot, name), limit ?? (() => 512));
 async Task<CaptureReservation> Capture(QueueStore store, int size = 32768, bool commit = true)
 {
@@ -230,6 +247,10 @@ try
             string script = (string)method.Invoke(null, parameters)!;
             await System.IO.File.WriteAllTextAsync(Path.Combine(folder, name == "Screenshot" ? "screenshot.ps1" : "camera.ps1"), script);
         }
+        var reinstall = typeof(Worker).GetMethod("BuildReinstallSelfScript", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+        string reinstallScript = (string)reinstall.Invoke(null, ["SyntheticService", 1, Path.Combine(folder, "Program Files", "synthetic.exe"), Path.Combine(folder, "status.txt"), Path.Combine(folder, "reinstall.log")])!;
+        await System.IO.File.WriteAllTextAsync(Path.Combine(folder, "reinstall.ps1"), reinstallScript);
+        Check(reinstallScript.Contains("New-Service") && !reinstallScript.Contains("binPath="), "Reinstall registers the service with a quoted path");
         var start = new ProcessStartInfo("powershell.exe") { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (string argument in new[] { "-NoProfile", "-File", Path.Combine(AppContext.BaseDirectory, "../../../HelperScripts.Tests.ps1"), "-Folder", folder }) start.ArgumentList.Add(argument);
         using var helper = Process.Start(start)!;
@@ -237,6 +258,78 @@ try
         await helper.WaitForExitAsync();
         if (helper.ExitCode != 0) Console.WriteLine(await errors);
         Check(helper.ExitCode == 0, "Generated PowerShell syntax and hard screenshot write cap");
+    }
+    {
+        long[] admins = [100, -500];
+        Check(CommandPolicy.IsAuthorizedSender(100, 100, admins), "Administrator in a private chat is accepted");
+        Check(!CommandPolicy.IsAuthorizedSender(-500, 777, admins), "Group member who is not an administrator is rejected");
+        Check(CommandPolicy.IsAuthorizedSender(-500, 100, admins), "Administrator writing in an allowlisted group is accepted");
+        Check(!CommandPolicy.IsAuthorizedSender(-500, null, admins) && !CommandPolicy.IsAuthorizedSender(999, 100, admins),
+            "Anonymous sender and unlisted chat are rejected");
+    }
+    {
+        var (privateKey, publicKey) = OtaSignature.GenerateKeyPair();
+        string package = Path.Combine(testRoot, "package.zip");
+        byte[] content = new byte[4096];
+        Random.Shared.NextBytes(content);
+        await System.IO.File.WriteAllBytesAsync(package, content);
+        string signature = OtaSignature.Sign(package, privateKey);
+        Check(OtaSignature.Verify(package, signature, publicKey), "Signed update package verifies");
+        Check(!OtaSignature.Verify(package, signature, OtaSignature.GenerateKeyPair().PublicKey), "Signature from a different key is rejected");
+        Check(!OtaSignature.Verify(package, "not-base64!", publicKey) && !OtaSignature.Verify(package, null, publicKey) &&
+            !OtaSignature.Verify(package, signature, "AAAA"), "Malformed or missing signature input is rejected");
+        content[100] ^= 1;
+        await System.IO.File.WriteAllBytesAsync(package, content);
+        Check(!OtaSignature.Verify(package, signature, publicKey), "Modified update package is rejected");
+    }
+    {
+        var paths = new SharedPathProvider(Path.Combine(testRoot, "app-root"));
+        string updates = paths.GetSharedTempDirectory("Updates");
+        Check(updates.StartsWith(testRoot, StringComparison.OrdinalIgnoreCase) && OnlyTrustedAccess(updates) &&
+            OnlyTrustedAccess(Path.GetDirectoryName(updates)!), "Service working folders are private to SYSTEM and administrators");
+        string script = Path.Combine(updates, "synthetic.ps1");
+        await System.IO.File.WriteAllTextAsync(script, "exit 0");
+        var scriptSecurity = new FileInfo(script).GetAccessControl();
+        bool leaked = false;
+        foreach (System.Security.AccessControl.FileSystemAccessRule rule in scriptSecurity.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier)))
+        {
+            var sid = (System.Security.Principal.SecurityIdentifier)rule.IdentityReference;
+            if (sid.IsWellKnown(System.Security.Principal.WellKnownSidType.InteractiveSid) || sid.IsWellKnown(System.Security.Principal.WellKnownSidType.BuiltinUsersSid) ||
+                sid.IsWellKnown(System.Security.Principal.WellKnownSidType.AuthenticatedUserSid) || sid.IsWellKnown(System.Security.Principal.WellKnownSidType.WorldSid)) leaked = true;
+        }
+        Check(!leaked, "Updater scripts inherit no access for ordinary users");
+        bool escaped = true;
+        try { paths.GetSharedTempDirectory("..\\escape"); } catch (ArgumentException) { escaped = false; }
+        Check(!escaped, "Service folder names cannot leave the private root");
+        Check(!SharedPathProvider.LegacyPublicRoot.StartsWith(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), StringComparison.OrdinalIgnoreCase),
+            "Legacy public folder is distinct from private storage");
+    }
+    {
+        string configDirectory = Path.Combine(testRoot, "config");
+        Directory.CreateDirectory(configDirectory);
+        var service = new ConfigurationFileService(configDirectory);
+        service.Save(new AppConfiguration { BotToken = "1:synthetic", AdminChatIds = [1] });
+        service.SaveAtomic(new AppConfiguration { BotToken = "1:synthetic", AdminChatIds = [1, 2] });
+        Check(OnlyTrustedAccess(service.ConfigPath) && service.Load().AdminChatIds.Length == 2,
+            "Configuration file is restricted to SYSTEM, administrators and its writer");
+        Check(Directory.GetFiles(configDirectory).Length == 1, "Configuration writes leave no temporary copies");
+    }
+    {
+        string source = Path.Combine(testRoot, "install-source"), target = Path.Combine(testRoot, "install-target");
+        Directory.CreateDirectory(Path.Combine(source, "runtimes"));
+        foreach (string name in new[] { "app.exe", "config.json", "config.json.bak", "setup.log", Path.Combine("runtimes", "native.dll") })
+            await System.IO.File.WriteAllTextAsync(Path.Combine(source, name), "synthetic");
+        int copied = InstallLayout.CopyApplicationFiles(source, target);
+        Check(copied == 2 && System.IO.File.Exists(Path.Combine(target, "runtimes", "native.dll")) &&
+            Directory.GetFiles(target).Length == 1, "Install copy leaves configuration and logs behind");
+        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        string custom = Path.Combine(programFiles, "Custom", "Tool");
+        Check(InstallLayout.ResolveInstallDirectory(source) == InstallLayout.DefaultInstallDirectory &&
+            InstallLayout.ResolveInstallDirectory(custom + Path.DirectorySeparatorChar) == custom &&
+            InstallLayout.ResolveInstallDirectory(programFiles + "Evil") == InstallLayout.DefaultInstallDirectory,
+            "Install relocates to Program Files unless already inside it");
+        Check(InstallLayout.IsWritableByNonAdministrators(Path.GetTempPath()) && !InstallLayout.IsWritableByNonAdministrators(programFiles),
+            "Install folders writable by ordinary users are detected");
     }
     if (args.Contains("--benchmark"))
     {
