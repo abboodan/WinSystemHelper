@@ -1,64 +1,30 @@
-using Telegram.Bot;
-
 namespace WinSystemHelper;
 
-public sealed class TelegramNotifier
+/// <summary>Success means durably queued, not delivered to Telegram.</summary>
+public sealed class TelegramNotifier(QueueStore store)
 {
-    private readonly ITelegramBotClient _botClient;
-    private readonly ILogger<TelegramNotifier> _logger;
-
-    public TelegramNotifier(
-        ITelegramBotClient botClient,
-        ILogger<TelegramNotifier> logger)
+    public async Task SendMessageAsync(long chatId, string text, TimeSpan timeout, CancellationToken cancellationToken)
     {
-        _botClient = botClient;
-        _logger = logger;
-    }
-
-    public async Task SendMessageAsync(
-        long chatId,
-        string text,
-        TimeSpan timeout,
-        CancellationToken cancellationToken)
-    {
-        using CancellationTokenSource timeoutToken =
-            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutToken.CancelAfter(timeout);
-
-        await _botClient.SendMessage(
-            chatId: chatId,
-            text: text,
-            cancellationToken: timeoutToken.Token);
-    }
-
-    public async Task<bool> BroadcastAsync(
-        IReadOnlyCollection<long> adminChatIds,
-        string text,
-        TimeSpan timeout,
-        CancellationToken cancellationToken)
-    {
-        var anyDelivered = false;
-
-        foreach (long adminChatId in adminChatIds)
+        cancellationToken.ThrowIfCancellationRequested();
+        CommandExecution? execution = CommandExecution.Current.Value;
+        string key = execution?.NextKey() ?? Guid.NewGuid().ToString("N");
+        for (int offset = 0, part = 0; offset < text.Length; part++)
         {
-            try
-            {
-                await SendMessageAsync(adminChatId, text, timeout, cancellationToken);
-                anyDelivered = true;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(
-                    ex,
-                    "Telegram broadcast delivery failed for admin chat {AdminChatId}.",
-                    adminChatId);
-            }
+            int length = Math.Min(4000, text.Length - offset);
+            if (char.IsHighSurrogate(text[offset + length - 1])) length--;
+            await store.EnqueueTextAsync(chatId, text.Substring(offset, length),
+                dedupe: $"{key}:{chatId}:{part}", expires: execution?.ReplyExpires, priority: execution?.Priority ?? false);
+            offset += length;
         }
+    }
 
-        return anyDelivered;
+    public async Task<bool> BroadcastAsync(IReadOnlyCollection<long> adminChatIds, string text,
+        TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        CommandExecution? execution = CommandExecution.Current.Value;
+        await store.EnqueueBroadcastAsync(adminChatIds, text, execution?.NextKey() ?? Guid.NewGuid().ToString("N"),
+            execution?.ReplyExpires, execution?.Priority ?? false);
+        return adminChatIds.Count > 0;
     }
 }

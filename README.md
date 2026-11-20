@@ -17,7 +17,7 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 - Session 0-aware command execution for workstation lock and alert sound behavior using active-user-session process launching.
 - Interactive active-user prompts using Base64-encoded PowerShell UI scripts.
 - Overt active-alarm microphone recording with local visual/audio warnings.
-- Optional persistent active-alarm mic loop restore after reboot, controlled by `PersistentMicLoopEnabled`.
+- Persistent command and delivery queues, offline media capture up to a configurable quota, and a visible local recording consent/stop window.
 - Admin-only OTA self-update from a Telegram ZIP document or HTTPS ZIP URL.
 - GitHub Release-based OTA updates with `/update github` for public repositories.
 - Confirmation gates and cooldowns for dangerous remote commands.
@@ -47,7 +47,10 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/alarm` | Plays a system alert sound through the active user session. |
 | `/mic [seconds]` | Triggers an overt active alarm and returns an audio recording. |
 | `/mic [seconds] loop` | Starts a persistent overt active alarm loop. |
-| `/mic stop` | Stops the persistent active alarm loop. |
+| `/mic stop` | Stops recording; queued media continues uploading. |
+| `/queue` | Shows storage usage, pending commands, and failed delivery IDs. |
+| `/queue retry [Id]` | Retries a failed, completed file or message belonging to the requester. |
+| `/queue delete [Id]` | Requests confirmation before deleting a queued item. |
 | `/msg [text]` | Shows a warning message on the active user's screen. |
 | `/ask [text]` | Shows a Yes/No question and returns the user's answer. |
 | `/prompt [text]` | Forces a text response from the active user and returns it to Telegram. |
@@ -212,13 +215,50 @@ If the machine powers off before Telegram delivery completes, a small JSON repor
 
 ## Persistent Active Alarm Mic Loop
 
-When `PersistentMicLoopEnabled` is true, `/mic [seconds] loop` stores only the active loop state under the shared `Audio` folder. If the laptop shuts down or restarts while the loop is active, the service restores the overt recording loop after startup and continues until an admin sends:
+A local user must approve a recording session. A visible window remains open with a Stop button; closing it stops recording. Camera photos and screenshots also require local approval. An audible/visual notice is issued when the session starts, not for every audio chunk.
+
+With `PersistentMicLoopEnabled`, an active loop can be restored after a service restart, but **local approval is requested again**. Local Stop, closing the recording window, or `/mic stop` disables automatic resumption. The service never replays an interrupted capture command automatically.
+
+### Offline storage and delivery
+
+Completed recordings and images are durably queued in `%ProgramData%/WinSystemHelper/Queue/<bot-scope>/`, outside the repository, temporary cleanup folders, and installation directory. SQLite holds metadata only; media is streamed from separate files. Access is limited to the service and administrators, with temporary per-capture access for the active local user. A different bot uses a separate store.
 
 ```text
+/config set OutboxMaxSizeMB 512
+/queue
+/queue retry <Id>
+/queue delete <Id>
 /mic stop
 ```
 
-The feature does not persist audio files. Each recording cycle still shows the local visual warning and plays the audible warning before recording.
+`OutboxMaxSizeMB` defaults to **512 MiB** (one unit is 1,048,576 bytes), accepts 1–65536, and can be changed without restarting. It includes completed, failed, and reserved in-progress media. Small queue metadata/control files are additional. Images reserve up to 10 MiB; a smaller configured quota cannot accept image capture. Audio reserves its uncompressed 16 kHz/16-bit mono size before recording.
+
+At capacity, production pauses without discarding existing files. An approved loop resumes below 80% usage when its next chunk fits. Lowering the quota never deletes files; raising it wakes the loop. Uploading does not block recording or the independent control lane. No compression/conversion is added. Capture failure or withdrawal of local approval stops the loop; incomplete files are retained for review/deletion, not uploaded as complete recordings.
+
+Temporary delivery failures retry with increasing delay (2 seconds to 5 minutes). Telegram rate-limit deadlines are respected. Permanent errors appear in `/queue`; they do not block unrelated messages. Acknowledged files are deleted only after success is stored. If Telegram accepted a file but its acknowledgement was lost, a retry can produce a duplicate bearing the same capture ID and original timestamp.
+
+### Command recovery
+
+Authorized commands are saved before advancing Telegram's polling offset. Time-sensitive commands older than five minutes are rejected; read-only requests, `/mic stop`, and `/cancel` remain valid. Pending confirmations expire and are invalidated on service restart. Commands interrupted during a possible side effect are reported as having an unknown outcome and are not automatically repeated. Read-only interrupted work can be retried.
+
+The command queue holds up to 1000 active entries (50 reserved for control), and the text queue up to 2000 entries (100 reserved for control replies). At ordinary capacity, new work is rejected with a coalesced notice. Completed history is pruned incrementally after 24 hours and bounded to 10000 rows per history table. Metadata remains bounded independently of media; retention cleanup does not discard undelivered files.
+
+Legacy power/update notices are imported idempotently. The old active-loop marker is moved into private storage. Repair and OTA operations do not remove the durable queue. Keep the store when updating; if storage initialization fails, the service stops rather than resetting the queue.
+
+### Validation and public publishing
+
+```powershell
+dotnet run --project tests/Queue.Tests.csproj -c Release
+dotnet run --project tests/Queue.Tests.csproj -c Release -- --benchmark
+powershell -NoProfile -File tests/PublishSafety.Tests.ps1
+powershell -NoProfile -File scripts/Check-PublishSafety.ps1 -Mode WorkingTree
+powershell -NoProfile -File scripts/Check-PublishSafety.ps1 -Mode Index
+powershell -NoProfile -File scripts/Check-PublishSafety.ps1 -Mode History
+```
+
+Tests use synthetic media and fake Telegram/session transports; they do not activate hardware or send messages. `/queue-storage-check` on the published executable checks bundled SQLite without installing or starting the service. See [queue validation](docs/queue-validation.md) for measurements and remaining interactive checks.
+
+The publishing helper checks staged content and history, printing only file locations and categories for potential secrets. Failed inspection blocks publication. Release CI enforces the four-file package allowlist. Runtime configs, media, logs, database files, keys, and local build products must stay untracked. Author identity and license attribution are intentionally public. Pattern checks supplement, rather than replace, review of the final diff and files being pushed.
 
 ## OTA Self-Update
 

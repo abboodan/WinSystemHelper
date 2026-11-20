@@ -34,6 +34,8 @@ public sealed class ConfigurationFileService
             throw new InvalidOperationException($"{ConfigPath} is missing BotToken or AdminChatIds.");
         }
 
+        if (configuration.OutboxMaxSizeMB is < 1 or > 65536)
+            throw new InvalidOperationException("OutboxMaxSizeMB must be between 1 and 65536 (MiB).");
         return configuration;
     }
 

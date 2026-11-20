@@ -199,9 +199,15 @@ public sealed class WindowsSessionProcessRunner : IWindowsSessionProcessRunner
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to start process in the active user session.");
             }
 
+            // Task.Run cancellation alone does not interrupt a native wait already in progress.
+            // Dispose this registration before closing the process handle in the outer finally.
+            using CancellationTokenRegistration cancellationRegistration = cancellationToken.Register(
+                () => TerminateProcessIfNeeded(processInformation.hProcess));
             uint waitResult = await Task.Run(
                 () => WaitForSingleObject(processInformation.hProcess, (uint)timeout.TotalMilliseconds),
                 cancellationToken);
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             if (waitResult == WaitTimeout)
             {

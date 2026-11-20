@@ -65,7 +65,7 @@ if "%REMOTE_URL%"=="" (
 set "STEP_REPO=OK"
 
 echo Branch:  %BRANCH%
-echo Origin:  %REMOTE_URL%
+echo Origin:  configured (URL omitted)
 echo.
 echo Current changes:
 git status --short
@@ -132,32 +132,17 @@ git diff --cached --name-status
 echo.
 
 echo [5/7] Running safety checks on staged files...
-set "STAGED_FILES=%TEMP%\winsystemhelper-staged-%RANDOM%.tmp"
-set "SECRET_SCAN=%TEMP%\winsystemhelper-secret-scan-%RANDOM%.tmp"
-git diff --cached --name-only > "%STAGED_FILES%" 2>> "%PUSH_LOG%"
-
-set "SECRET_SCAN_SIZE=0"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$blocked = Get-Content -LiteralPath $env:STAGED_FILES | Where-Object { $_ -match '(^|/)(config\.json|appsettings\.json|appsettings\.Development\.json|secrets\.json|.*\.log|.*\.zip)$' -or $_ -match '(^|/)(dist|artifacts|bin|obj)/' }; $blocked" > "%SECRET_SCAN%" 2>nul
-if exist "%SECRET_SCAN%" for %%F in ("%SECRET_SCAN%") do set "SECRET_SCAN_SIZE=%%~zF"
-if not "!SECRET_SCAN_SIZE!"=="0" (
-    echo.
-    echo Sensitive or generated files are staged. Review and unstage them before pushing:
-    type "%SECRET_SCAN%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\Check-PublishSafety.ps1" -Mode Index
+if errorlevel 1 (
     set "STEP_SECRET_SCAN=FAILED"
-    set "FAILED_STEP=Sensitive staged file check"
+    set "FAILED_STEP=Index privacy inspection"
     set "ERROR_CODE=1"
     goto :fail
 )
-
-set "SECRET_SCAN_SIZE=0"
-git grep --cached -n -I -E "([0-9]{8,}:[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+|-----BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)" > "%SECRET_SCAN%" 2>nul
-if exist "%SECRET_SCAN%" for %%F in ("%SECRET_SCAN%") do set "SECRET_SCAN_SIZE=%%~zF"
-if not "!SECRET_SCAN_SIZE!"=="0" (
-    echo.
-    echo Possible secret values were found in staged content:
-    type "%SECRET_SCAN%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%scripts\Check-PublishSafety.ps1" -Mode History
+if errorlevel 1 (
     set "STEP_SECRET_SCAN=FAILED"
-    set "FAILED_STEP=Secret pattern scan"
+    set "FAILED_STEP=History privacy inspection"
     set "ERROR_CODE=1"
     goto :fail
 )
@@ -171,8 +156,6 @@ if not "!LAST_STEP_CODE!"=="0" (
     goto :fail
 )
 
-if exist "%STAGED_FILES%" del /q "%STAGED_FILES%" 2>nul
-if exist "%SECRET_SCAN%" del /q "%SECRET_SCAN%" 2>nul
 set "STEP_SECRET_SCAN=OK"
 
 echo.

@@ -16,6 +16,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check source privacy
+        shell: pwsh
+        run: |
+          ./scripts/Check-PublishSafety.ps1 -Mode WorkingTree
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/Check-PublishSafety.ps1 -Mode History
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Setup .NET 8 SDK
         uses: actions/setup-dotnet@v4
@@ -26,6 +36,15 @@ jobs:
         shell: cmd
         run: build.cmd
 
+      - name: Test durable queue with synthetic media
+        shell: pwsh
+        run: |
+          dotnet run --project tests/Queue.Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./tests/PublishSafety.Tests.ps1
+          ./dist/WinSystemHelper.exe /queue-storage-check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Verify OTA package
         shell: pwsh
         run: |
@@ -35,11 +54,14 @@ jobs:
           }
 
           $items = tar -tf $package
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect release package.' }
           foreach ($required in @("WinSystemHelper.exe", "WinSystemHelper.Bootstrapper.exe", "install.ps1", "README.md")) {
             if ($items -notcontains $required) {
               throw "OTA package is missing required file: $required"
             }
           }
+          ./scripts/Check-PublishSafety.ps1 -Mode WorkingTree -Package $package
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Publish GitHub Release
         shell: pwsh

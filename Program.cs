@@ -14,6 +14,15 @@ async Task<int> RunAsync(string[] launchArgs)
 {
     try
     {
+        if (launchArgs.Length == 1 && launchArgs[0] == "/queue-storage-check")
+        {
+            using var connection = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=:memory:");
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT sqlite_version()";
+            Console.WriteLine($"SQLite storage available: {command.ExecuteScalar()}");
+            return 0;
+        }
         if (IsMicRecorderHelperMode(launchArgs))
         {
             return await RunMicRecorderHelperAsync(launchArgs);
@@ -178,11 +187,14 @@ async Task RunServiceModeAsync()
             services.AddSingleton<ITelegramBotClient>(_ =>
                 new TelegramBotClient(configuration.BotToken));
             services.AddSingleton<TelegramMenuService>();
+            services.AddSingleton<QueueStore>();
+            services.AddSingleton<IOutboxTransport, TelegramOutboxTransport>();
             services.AddSingleton<TelegramNotifier>();
             services.AddSingleton<CooldownService>();
             services.AddSingleton<IProcessRunner, ProcessRunner>();
             services.AddSingleton<ISharedPathProvider, SharedPathProvider>();
             services.AddSingleton<IWindowsSessionProcessRunner, WindowsSessionProcessRunner>();
+            services.AddHostedService<OutboxSender>();
             services.AddHostedService<Worker>();
         })
         .Build();
@@ -298,7 +310,8 @@ static async Task<int> RunMicRecorderHelperAsync(string[] launchArgs)
 
     Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
     await RecordWavAsync(outputPath, seconds, CancellationToken.None);
-
+    await using (var completed = new FileStream(outputPath, FileMode.Open, FileAccess.Write, FileShare.None)) completed.Flush(true);
+    await File.WriteAllTextAsync(outputPath + ".complete", "complete");
     return 0;
 }
 
@@ -318,12 +331,14 @@ static async Task RecordWavAsync(
 
     await using WaveFileWriter writer = new(outputPath, waveIn.WaveFormat);
 
+    long remaining = durationSeconds * 32000L;
     waveIn.DataAvailable += (_, e) =>
     {
         if (e.BytesRecorded > 0)
         {
-            writer.Write(e.Buffer, 0, e.BytesRecorded);
-            writer.Flush();
+            int count = (int)Math.Min(e.BytesRecorded, remaining);
+            if (count > 0) writer.Write(e.Buffer, 0, count);
+            remaining -= count;
         }
     };
 

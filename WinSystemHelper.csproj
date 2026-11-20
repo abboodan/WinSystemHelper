@@ -12,13 +12,15 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="WinSystemHelper.Bootstrapper\**;build-verify\**;dist\**;publish\**" />
-    <Content Remove="WinSystemHelper.Bootstrapper\**;build-verify\**;dist\**;publish\**" />
-    <EmbeddedResource Remove="WinSystemHelper.Bootstrapper\**;build-verify\**;dist\**;publish\**" />
-    <None Remove="WinSystemHelper.Bootstrapper\**;build-verify\**;dist\**;publish\**" />
+    <Compile Remove="WinSystemHelper.Bootstrapper\**;build-verify*\**;dist\**;publish\**;tests\**;artifacts\**" />
+    <Content Remove="WinSystemHelper.Bootstrapper\**;build-verify*\**;dist\**;publish\**;tests\**;artifacts\**" />
+    <EmbeddedResource Remove="WinSystemHelper.Bootstrapper\**;build-verify*\**;dist\**;publish\**;tests\**;artifacts\**" />
+    <None Remove="WinSystemHelper.Bootstrapper\**;build-verify*\**;dist\**;publish\**;tests\**;artifacts\**" />
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.20" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.5" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.1" />

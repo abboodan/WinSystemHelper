@@ -46,10 +46,35 @@ config.json
 appsettings.json
 appsettings.Development.json
 secrets.json
+.env
+.env.*
+config.json.*
+appsettings.*.json
+*.pem
+*.pfx
+*.p12
+*.key
 
 # Temporary audio or local test artifacts
 *.wav
 *.mp3
+*.ogg
+*.m4a
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.zip
+*.7z
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+Queue/
+Capture/
+Backups/
+*.dmp
 *.tmp
 *.temp
 

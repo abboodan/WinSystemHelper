@@ -31,6 +31,8 @@ public sealed class AppConfiguration
 
     public bool PersistentMicLoopEnabled { get; set; } = true;
 
+    public int OutboxMaxSizeMB { get; set; } = 512;
+
     public bool AllowCrossAdminConfirmations { get; set; }
 
     public bool PowerEventAlertsEnabled { get; set; } = true;

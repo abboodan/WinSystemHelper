@@ -27,7 +27,7 @@ internal static class Program
             string appPath = Path.Combine(baseDirectory, AppExeName);
             string logPath = Path.Combine(baseDirectory, "WinSystemHelper.Bootstrapper.log");
 
-            Log(logPath, $"Bootstrapper started. Args: {string.Join(' ', args)}");
+            Log(logPath, "Bootstrapper started. Command-line values are omitted for privacy.");
 
             if (!File.Exists(appPath))
             {
