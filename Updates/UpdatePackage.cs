@@ -167,14 +167,10 @@ internal sealed class UpdatePackage(
             if (progressCallback is not null && totalBytesHint is > 0)
             {
                 int percent = (int)Math.Clamp(totalBytes * 100 / totalBytesHint.Value, 0, 100);
-                if (percent >= nextProgressPercent && percent < 100)
+                while (nextProgressPercent < 100 && percent >= nextProgressPercent)
                 {
-                    await progressCallback(percent, cancellationToken);
-                    nextProgressPercent = Math.Min(90, ((percent / 10) + 1) * 10);
-                    if (nextProgressPercent <= percent)
-                    {
-                        nextProgressPercent = Math.Min(90, percent + 10);
-                    }
+                    await progressCallback(nextProgressPercent, cancellationToken);
+                    nextProgressPercent += 10;
                 }
             }
         }
