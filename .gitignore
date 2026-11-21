@@ -9,6 +9,7 @@ publish/
 artifacts/
 dist/
 TestResults/
+/.dotnet/
 
 # User-specific files
 .vs/

@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -28,7 +28,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Setup .NET 8 SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "8.0.x"
 
@@ -36,10 +36,10 @@ jobs:
         shell: cmd
         run: build.cmd
 
-      - name: Test durable queue with synthetic media
+      - name: Test the release
         shell: pwsh
         run: |
-          dotnet run --project tests/Queue.Tests.csproj -c Release
+          dotnet test WinSystemHelper.sln -c Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./tests/PublishSafety.Tests.ps1
           ./dist/WinSystemHelper.exe /queue-storage-check
@@ -83,7 +83,7 @@ jobs:
             throw 'This build requires signed updates, but the package has no valid signature. Check the OTA_SIGNING_KEY secret against OtaSignature.PinnedPublicKey.'
           }
 
-      - name: Publish GitHub Release
+      - name: Upload GitHub Release assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -92,7 +92,12 @@ jobs:
           $package = Join-Path $env:GITHUB_WORKSPACE "artifacts\WinSystemHelper-ota.zip"
           $assets = @($package)
           if (Test-Path -LiteralPath "$package.sig") { $assets += "$package.sig" }
-          gh release create $tag @assets `
-            --repo "${{ github.repository }}" `
-            --title "WinSystemHelper $tag" `
-            --notes "Automated WinSystemHelper OTA release for $tag."
+          $repo = "${{ github.repository }}"
+          $draft = gh release view $tag --repo $repo --json isDraft --jq '.isDraft' 2>$null
+          if ($LASTEXITCODE -eq 0 -and $draft -eq 'true') {
+            gh release upload $tag @assets --repo $repo
+          }
+          else {
+            gh release create $tag @assets --repo $repo --verify-tag --title "WinSystemHelper $tag" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
