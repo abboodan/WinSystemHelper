@@ -19,7 +19,7 @@ internal static class Program
             if (args.Any(arg => arg.Equals("--version", StringComparison.OrdinalIgnoreCase) ||
                     arg.Equals("/version", StringComparison.OrdinalIgnoreCase)))
             {
-                Console.WriteLine("WinSystemHelper Bootstrapper 1.7.1");
+                Console.WriteLine("WinSystemHelper Bootstrapper 1.7.2");
                 return 0;
             }
 
