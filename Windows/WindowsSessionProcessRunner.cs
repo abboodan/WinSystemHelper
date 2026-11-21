@@ -59,7 +59,9 @@ public sealed class WindowsSessionProcessRunner : IWindowsSessionProcessRunner
             : $"Available (Session {sessionId})";
     }
 
-    public string? TryGetActiveUserSid()
+    public string? TryGetActiveUserSid() => TryGetActiveConsoleSession()?.UserSid;
+
+    public WindowsConsoleSession? TryGetActiveConsoleSession()
     {
         uint sessionId = WTSGetActiveConsoleSessionId();
         if (sessionId == ActiveConsoleSessionUnavailable)
@@ -75,7 +77,7 @@ public sealed class WindowsSessionProcessRunner : IWindowsSessionProcessRunner
         try
         {
             using WindowsIdentity identity = new(userToken);
-            return identity.User?.Value;
+            return identity.User is { } user ? new WindowsConsoleSession(sessionId, user.Value) : null;
         }
         catch
         {
@@ -151,8 +153,10 @@ public sealed class WindowsSessionProcessRunner : IWindowsSessionProcessRunner
         string fileName,
         string arguments,
         TimeSpan timeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        WindowsConsoleSession? requiredSession = null)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         uint sessionId = WTSGetActiveConsoleSessionId();
         if (sessionId == ActiveConsoleSessionUnavailable)
         {
@@ -169,6 +173,15 @@ public sealed class WindowsSessionProcessRunner : IWindowsSessionProcessRunner
 
         try
         {
+            if (requiredSession is not null)
+            {
+                using var identity = new WindowsIdentity(userToken);
+                if (sessionId != requiredSession.Id || identity.User?.Value != requiredSession.UserSid)
+                {
+                    throw new InvalidOperationException("The Windows console session that approved development mode is no longer active.");
+                }
+            }
+
             uint creationFlags = CreateNoWindow;
             if (CreateEnvironmentBlock(out environment, userToken, inherit: false))
             {
@@ -183,6 +196,7 @@ public sealed class WindowsSessionProcessRunner : IWindowsSessionProcessRunner
                 lpDesktop = "winsta0\\default"
             };
 
+            cancellationToken.ThrowIfCancellationRequested();
             if (!CreateProcessAsUser(
                     userToken,
                     applicationName: null,
@@ -243,7 +257,7 @@ public sealed class WindowsSessionProcessRunner : IWindowsSessionProcessRunner
 
     public void StartWindowsPowerShell(string arguments)
     {
-        StartProcess(GetWindowsPowerShellPath(), arguments);
+        StartProcess(WindowsProcess.GetWindowsPowerShellPath(), arguments);
     }
 
     public void StartEncodedPowerShell(string script)
@@ -254,13 +268,15 @@ public sealed class WindowsSessionProcessRunner : IWindowsSessionProcessRunner
     public Task<uint> StartEncodedPowerShellAndWaitAsync(
         string script,
         TimeSpan timeout,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        WindowsConsoleSession? requiredSession = null)
     {
         return StartProcessAndWaitAsync(
-            GetWindowsPowerShellPath(),
+            WindowsProcess.GetWindowsPowerShellPath(),
             BuildEncodedPowerShellArguments(script),
             timeout,
-            cancellationToken);
+            cancellationToken,
+            requiredSession);
     }
 
     private static string BuildEncodedPowerShellArguments(string script)
@@ -274,22 +290,6 @@ public sealed class WindowsSessionProcessRunner : IWindowsSessionProcessRunner
         return Path.IsPathRooted(fileName)
             ? fileName
             : Path.Combine(Environment.SystemDirectory, fileName);
-    }
-
-    private static string GetWindowsPowerShellPath()
-    {
-        string powerShellPath = Path.Combine(
-            Environment.SystemDirectory,
-            "WindowsPowerShell",
-            "v1.0",
-            "powershell.exe");
-
-        if (!File.Exists(powerShellPath))
-        {
-            throw new InvalidOperationException($"PowerShell was not found at {powerShellPath}.");
-        }
-
-        return powerShellPath;
     }
 
     private static void CloseHandleIfNeeded(IntPtr handle)

@@ -1,8 +1,6 @@
-using System.Text.Json;
 using Telegram.Bot;
 using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types;
-using Telegram.Bot.Types.ReplyMarkups;
 
 namespace WinSystemHelper;
 
@@ -15,17 +13,18 @@ public sealed class TelegramOutboxTransport(ITelegramBotClient client) : IOutbox
 {
     public async Task SendAsync(OutboxItem item, CancellationToken token)
     {
-        if (item.Kind == "text")
+        if (item.Kind == QueueItemKind.Text)
         {
+            var (parseMode, keyboard) = TelegramReplyStyle.Read(item.Markup);
             await client.SendMessage(item.ChatId, item.Text,
-                replyMarkup: item.Markup is null ? null : JsonSerializer.Deserialize<ReplyKeyboardMarkup>(item.Markup), cancellationToken: token);
+                parseMode: parseMode, replyMarkup: keyboard, cancellationToken: token);
             return;
         }
         await using var stream = new FileStream(item.Path!, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
         var input = InputFile.FromStream(stream, Path.GetFileName(item.Path!));
-        if (item.Kind == "voice")
+        if (item.Kind == QueueItemKind.Voice)
             await client.SendVoice(item.ChatId, input, caption: item.Text, duration: item.Duration, cancellationToken: token);
-        else if (item.Kind == "photo")
+        else if (item.Kind == QueueItemKind.Photo)
             await client.SendPhoto(item.ChatId, input, caption: item.Text, cancellationToken: token);
         else
             await client.SendDocument(item.ChatId, input, caption: item.Text, cancellationToken: token);

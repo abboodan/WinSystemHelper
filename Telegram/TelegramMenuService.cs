@@ -68,9 +68,12 @@ public sealed class TelegramMenuService
     {
         return
         [
+            new BotCommand { Command = "menu", Description = "🧭 Open the interactive command menu" },
             new BotCommand { Command = "queue", Description = "Show pending files, capacity, and delivery failures" },
             new BotCommand { Command = "status", Description = "Show service status" },
+            new BotCommand { Command = "mode", Description = "Show or change development and production mode" },
             new BotCommand { Command = "healthcheck", Description = "Show fast healthcheck" },
+            new BotCommand { Command = "log", Description = "Show recent service log lines" },
             new BotCommand { Command = "version", Description = "Show or check installed version" },
             new BotCommand { Command = "ping", Description = "Check bot responsiveness" },
             new BotCommand { Command = "confirm", Description = "Confirm pending command" },

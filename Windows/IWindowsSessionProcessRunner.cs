@@ -1,10 +1,13 @@
 namespace WinSystemHelper;
 
+public sealed record WindowsConsoleSession(uint Id, string UserSid);
+
 public interface IWindowsSessionProcessRunner
 {
     string GetActiveConsoleSessionStatus();
 
     string? TryGetActiveUserSid();
+    WindowsConsoleSession? TryGetActiveConsoleSession();
 
     void StartProcess(string fileName, string arguments);
 
@@ -12,7 +15,8 @@ public interface IWindowsSessionProcessRunner
         string fileName,
         string arguments,
         TimeSpan timeout,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken,
+        WindowsConsoleSession? requiredSession = null);
 
     void StartWindowsPowerShell(string arguments);
 
@@ -21,5 +25,6 @@ public interface IWindowsSessionProcessRunner
     Task<uint> StartEncodedPowerShellAndWaitAsync(
         string script,
         TimeSpan timeout,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken,
+        WindowsConsoleSession? requiredSession = null);
 }

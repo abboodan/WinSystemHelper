@@ -5,6 +5,21 @@ foreach ($file in Get-ChildItem -LiteralPath $Folder -Filter '*.ps1') {
     $errors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
     if ($errors.Count -gt 0) { throw "Generated helper has a syntax error: $($file.Name)" }
+    if ($file.Name -eq 'development.ps1') {
+        $definition = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                $node.Value.Contains('public sealed class DevelopmentConsentForm')
+        }, $true)
+        if ($null -eq $definition) { throw 'Missing development consent form.' }
+        Add-Type -TypeDefinition $definition.Value -ReferencedAssemblies 'System.dll','System.Windows.Forms.dll','System.Drawing.dll'
+    }
+    if ($file.Name -eq 'camera.ps1') {
+        $pathCommands = $ast.FindAll({ param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -in 'New-Item', 'Test-Path', 'Remove-Item'
+        }, $true)
+        if ($pathCommands.Count -gt 0) { throw 'The camera helper must use the existing reservation without PowerShell path commands.' }
+    }
     if ($file.Name -eq 'screenshot.ps1') {
         $definition = $ast.FindAll({ param($node)
             $node -is [Management.Automation.Language.StringConstantExpressionAst] -and

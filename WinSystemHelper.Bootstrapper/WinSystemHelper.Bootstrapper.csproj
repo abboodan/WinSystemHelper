@@ -8,11 +8,19 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishAot>true</PublishAot>
+    <RuntimeFrameworkVersion>8.0.33</RuntimeFrameworkVersion>
     <InvariantGlobalization>true</InvariantGlobalization>
     <Version>1.6.0</Version>
     <AssemblyVersion>1.6.0.0</AssemblyVersion>
     <FileVersion>1.6.0.0</FileVersion>
     <InformationalVersion>1.6.0</InformationalVersion>
   </PropertyGroup>
+
+  <!-- Keep the SDK-resolved NativeAOT toolchain on the same patched version as the runtime. -->
+  <Target Name="SetBootstrapperILCompilerVersion" BeforeTargets="ProcessFrameworkReferences">
+    <ItemGroup>
+      <KnownILCompilerPack Update="Microsoft.DotNet.ILCompiler" ILCompilerPackVersion="$(RuntimeFrameworkVersion)" />
+    </ItemGroup>
+  </Target>
 
 </Project>

@@ -12,6 +12,7 @@ public sealed class AppConfiguration
     public long AdminChatId { get; set; }
 
     public bool AlertsEnabled { get; set; } = true;
+    public bool AllowDevelopmentMode { get; set; } = true;
 
     public int BatteryLowPercent { get; set; } = 20;
 
@@ -46,6 +47,11 @@ public sealed class AppConfiguration
     public string GitHubRepo { get; set; } = "WinSystemHelper";
 
     public string GitHubReleaseAssetName { get; set; } = "WinSystemHelper-ota.zip";
+
+    internal AppConfiguration Clone()
+    {
+        return (AppConfiguration)MemberwiseClone();
+    }
 
     public IReadOnlyList<long> GetEffectiveAdminChatIds()
     {

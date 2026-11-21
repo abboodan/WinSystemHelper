@@ -251,13 +251,32 @@ async Task RunServiceModeAsync()
 {
     AppConfiguration configuration = LoadConfiguration();
 
+    var sharedPaths = new SharedPathProvider();
+    using FileLogStore logStore = FileLogStore.CreateForService(sharedPaths);
+    logStore.SetSecret(configuration.BotToken);
+
+    // Last chance to leave a trace before the process disappears.
+    AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        logStore.RecordCrash("UnhandledException", e.ExceptionObject as Exception);
+    TaskScheduler.UnobservedTaskException += (_, e) =>
+    {
+        logStore.Write("ERR", "UnobservedTask", "A background task failed without being awaited.", e.Exception);
+        e.SetObserved();
+    };
+
     IHost host = Host.CreateDefaultBuilder(args)
         .UseWindowsService(options =>
         {
             options.ServiceName = ServiceName;
         })
+        .ConfigureLogging(logging => logging.AddProvider(new FileLoggerProvider(logStore)))
         .ConfigureServices(services =>
         {
+            // A failed background service must not be stopped "cleanly": CrashGuard
+            // records the cause and exits with a failure code so Windows restarts it.
+            services.Configure<HostOptions>(options =>
+                options.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore);
+            services.AddSingleton(logStore);
             services.AddSingleton(configuration);
             services.AddSingleton(configurationFileService);
             services.AddHttpClient();
@@ -269,10 +288,12 @@ async Task RunServiceModeAsync()
             services.AddSingleton<TelegramNotifier>();
             services.AddSingleton<CooldownService>();
             services.AddSingleton<IProcessRunner, ProcessRunner>();
-            services.AddSingleton<ISharedPathProvider, SharedPathProvider>();
+            services.AddSingleton<ISharedPathProvider>(sharedPaths);
             services.AddSingleton<IWindowsSessionProcessRunner, WindowsSessionProcessRunner>();
             services.AddHostedService<OutboxSender>();
             services.AddHostedService<Worker>();
+            // Must stay last: it watches the services registered before it.
+            services.AddHostedService<CrashGuard>();
         })
         .Build();
 
@@ -393,65 +414,63 @@ static async Task<int> RunMicRecorderHelperAsync(string[] launchArgs)
 
     if (string.IsNullOrWhiteSpace(outputPath))
     {
-        return 2;
+        return MicRecorderFailure.MissingOutputPath;
     }
 
-    Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
-    await RecordWavAsync(outputPath, seconds, CancellationToken.None);
-    await using (var completed = new FileStream(outputPath, FileMode.Open, FileAccess.Write, FileShare.None)) completed.Flush(true);
-    await File.WriteAllTextAsync(outputPath + ".complete", "complete");
-    return 0;
-}
-
-static async Task RecordWavAsync(
-    string outputPath,
-    int durationSeconds,
-    CancellationToken cancellationToken)
-{
-    TaskCompletionSource<Exception?> recordingStopped =
-        new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-    using WaveInEvent waveIn = new()
-    {
-        WaveFormat = new WaveFormat(16000, 16, 1),
-        BufferMilliseconds = 100
-    };
-
-    await using WaveFileWriter writer = new(outputPath, waveIn.WaveFormat);
-
-    long remaining = durationSeconds * 32000L;
-    waveIn.DataAvailable += (_, e) =>
-    {
-        if (e.BytesRecorded > 0)
-        {
-            int count = (int)Math.Min(e.BytesRecorded, remaining);
-            if (count > 0) writer.Write(e.Buffer, 0, count);
-            remaining -= count;
-        }
-    };
-
-    waveIn.RecordingStopped += (_, e) =>
-    {
-        recordingStopped.TrySetResult(e.Exception);
-    };
-
-    waveIn.StartRecording();
-
+    MicRecordingStage stage = MicRecordingStage.PrepareOutput;
     try
     {
-        await Task.Delay(TimeSpan.FromSeconds(durationSeconds), cancellationToken);
-    }
-    finally
-    {
-        waveIn.StopRecording();
-    }
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        var recordingStopped = new TaskCompletionSource<Exception?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        long maxAudioBytes = seconds * 32000L;
+        long remaining = maxAudioBytes;
 
-    Exception? recordingException =
-        await recordingStopped.Task.WaitAsync(TimeSpan.FromSeconds(5), CancellationToken.None);
+        using (var waveIn = new WaveInEvent { WaveFormat = new WaveFormat(16000, 16, 1), BufferMilliseconds = 100 })
+        {
+            await using var writer = new WaveFileWriter(outputPath, waveIn.WaveFormat);
+            waveIn.DataAvailable += (_, e) =>
+            {
+                int count = (int)Math.Min(e.BytesRecorded, remaining);
+                if (count > 0)
+                {
+                    writer.Write(e.Buffer, 0, count);
+                    remaining -= count;
+                }
+            };
+            waveIn.RecordingStopped += (_, e) => recordingStopped.TrySetResult(e.Exception);
 
-    if (recordingException is not null)
+            stage = MicRecordingStage.OpenMicrophone;
+            waveIn.StartRecording();
+            stage = MicRecordingStage.RecordAudio;
+            await Task.WhenAny(recordingStopped.Task, Task.Delay(TimeSpan.FromSeconds(seconds)));
+            if (!recordingStopped.Task.IsCompleted)
+            {
+                waveIn.StopRecording();
+            }
+
+            if (await recordingStopped.Task.WaitAsync(TimeSpan.FromSeconds(5)) is { } recordingException)
+            {
+                throw recordingException;
+            }
+
+            stage = MicRecordingStage.SaveOutput;
+        }
+
+        if (remaining == maxAudioBytes)
+        {
+            return MicRecorderFailure.NoAudioSamples;
+        }
+
+        await using (var completed = new FileStream(outputPath, FileMode.Open, FileAccess.Write, FileShare.None))
+        {
+            completed.Flush(true);
+        }
+        await File.WriteAllTextAsync(outputPath + ".complete", "complete");
+        return 0;
+    }
+    catch (Exception ex)
     {
-        throw recordingException;
+        return MicRecorderFailure.Encode(stage, ex);
     }
 }
 

@@ -1,8 +1,18 @@
+using Telegram.Bot.Types.ReplyMarkups;
+
 namespace WinSystemHelper;
 
 /// <summary>Success means durably queued, not delivered to Telegram.</summary>
 public sealed class TelegramNotifier(QueueStore store)
 {
+    public Task SendHtmlAsync(long chatId, string html, InlineKeyboardMarkup? keyboard, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        CommandExecution? execution = CommandExecution.Current.Value;
+        return store.EnqueueTextAsync(chatId, html, TelegramReplyStyle.Html(keyboard),
+            dedupe: execution?.NextKey(), expires: execution?.ReplyExpires, priority: execution?.Priority ?? false);
+    }
+
     public async Task SendMessageAsync(long chatId, string text, TimeSpan timeout, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();

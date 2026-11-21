@@ -30,8 +30,12 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 
 | Command | Description |
 | --- | --- |
+| `/menu` | Opens the interactive command menu in the current chat. |
 | `/status` | Shows the full low-overhead system, runtime, service, battery, and wake watcher dashboard. |
+| `/mode [production\|development]` | Shows the operating mode or asks to change it. |
 | `/healthcheck` | Shows a fast health summary with cached state and recent failures. |
+| `/log [lines]` | Shows the latest service log lines (default 40, up to 200). |
+| `/log file` | Sends the service log as a file. |
 | `/version` | Shows the installed WinSystemHelper version. |
 | `/version check` | Checks the latest GitHub Release version and reports whether an update is available. |
 | `/ping` | Returns a lightweight online response with machine name and timestamp. |
@@ -78,6 +82,8 @@ WinSystemHelper is a personal Windows device management utility built as a hybri
 | `/help` | Shows the available remote commands. |
 | `/stop` | Requests confirmation before stopping the WinSystemHelper service. |
 | `/uninstall` | Requests confirmation before stopping and deleting the WinSystemHelper service. |
+
+Use `/menu` to browse command categories with Telegram buttons. Status and diagnostic actions can be selected directly. Copy buttons put the displayed command on the clipboard so you can review and send it. `/help` still shows the text command reference and reply keyboard. Queue reports show recent failures first, with the reason above the item ID.
 
 ## Build
 
@@ -209,6 +215,14 @@ Supported runtime keys include `AlertsEnabled`, `BatteryLowPercent`, `DiskLowPer
 
 Dangerous commands such as shutdown, restart, sleep, update, process termination, service control, stop, and uninstall require `/confirm [Id]` before execution.
 
+## Production and development modes
+
+WinSystemHelper starts in `production`. A configured Telegram administrator can request `/mode development`. One window on the active Windows desktop explains that the requesting administrator and chat can take screenshots, camera photos, and audio without separate prompts after the local user approves. The window stays visible while development is active, with an **End development mode** button.
+
+Use `/mode production`, click the button, or close the window to revoke permission. Locking, disconnecting, or signing out of that Windows session also ends it. Each activation requires fresh local approval. Development recordings stop when permission ends, and development mode starts fresh in production after a service restart.
+
+Telegram notifications and command results are available in both modes. Commands that explicitly ask the computer to show a message, play sound, or collect an answer still do so. Check the current mode with `/mode`, `/status`, or `/config`. Set `"allowDevelopmentMode": false` in the local `config.json` and restart the service to disable development requests on a device.
+
 ## Power Event Alerts
 
 Shutdown, restart, and sleep commands sent through Telegram broadcast an alert before the system action starts. The service also watches the Windows System event log for local shutdown/restart requests and sleep transitions, then attempts to notify all configured admins.
@@ -256,7 +270,7 @@ Legacy power/update notices are imported idempotently. The old active-loop marke
 ### Validation and public publishing
 
 ```powershell
-dotnet run --project tests/Queue.Tests.csproj -c Release
+dotnet test tests/Queue.Tests.csproj -c Release
 dotnet run --project tests/Queue.Tests.csproj -c Release -- --benchmark
 powershell -NoProfile -File tests/PublishSafety.Tests.ps1
 powershell -NoProfile -File scripts/Check-PublishSafety.ps1 -Mode WorkingTree
@@ -381,6 +395,20 @@ Before stopping the service, `/update` verifies that the endpoint is safe to res
 - The ZIP must contain a non-empty `WinSystemHelper.exe` at the payload root and must not include `config.json`.
 
 If any check fails, the bot rejects the update with a clear warning and keeps the existing service running.
+
+## Diagnostics and crash recovery
+
+The service keeps a rotating log in `%ProgramData%\WinSystemHelper\Service\Logs` (`service.log`, 1 MiB per file, two older files kept). It records startup and shutdown, each command word with its chat ID, warnings, and errors with their stack traces. Command arguments are not logged, and the bot token is removed from every line.
+
+```text
+/log            latest 40 lines
+/log 120        latest 120 lines (up to 200, trimmed to fit one message)
+/log file       all retained log files as one document
+```
+
+If a background task fails, the cause is written to the log and the process exits with a failure code instead of stopping quietly. Windows then restarts the service: after 1 minute on the first failure and after 5 minutes on the second; a third failure within a day leaves it stopped, so a build that crashes on start cannot loop. The service applies this recovery policy to itself on every start, so OTA-updated installs get it too.
+
+After an abnormal stop, the next start queues a notice with the recorded error for every admin. If the queue is temporarily unavailable or full, the service retains the notice and retries. A normal stop, restart, update, or Windows shutdown produces no notice. If private log storage cannot be opened at startup, file logging and crash notices are disabled for that run.
 
 ## Service storage
 
