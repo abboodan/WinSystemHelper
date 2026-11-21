@@ -88,7 +88,7 @@ internal sealed class UpdatePackage(
             ? async (percent, token) =>
             {
                 await reply.SendTelegramMessageOnceAsync(
-                    $"⬇️ GitHub update download progress: {percent}%",
+                    $"{TelegramReplies.GitHubUpdateProgressPrefix}{percent}%",
                     token);
             }
             : null;

@@ -1,9 +1,17 @@
+using System.Globalization;
 using System.Text;
 
 namespace WinSystemHelper;
 
 public static class TelegramReplies
 {
+    internal const string GitHubUpdateProgressPrefix = "⬇️ GitHub update download progress: ";
+
+    internal static bool IsGitHubUpdateProgress(string text) =>
+        text.StartsWith(GitHubUpdateProgressPrefix, StringComparison.Ordinal) && text.EndsWith('%') &&
+        int.TryParse(text.AsSpan(GitHubUpdateProgressPrefix.Length, text.Length - GitHubUpdateProgressPrefix.Length - 1),
+            NumberStyles.None, CultureInfo.InvariantCulture, out int percent) && percent is >= 10 and <= 100;
+
     public static string Queue(QueueSnapshot queue)
     {
         var report = new StringBuilder("📦 <b>Delivery queue</b>\n\n")

@@ -132,11 +132,13 @@ public sealed partial class QueueStore : IDisposable
                   priority INTEGER NOT NULL,created INTEGER NOT NULL,state TEXT NOT NULL,finished INTEGER);
                 CREATE INDEX IF NOT EXISTS commands_ready ON commands(priority,state,id);
                 PRAGMA user_version=1;
-                UPDATE outbox SET state='ready' WHERE state='sending';
+                UPDATE outbox SET state=CASE WHEN error=$progressInFlight THEN 'deleted' ELSE 'ready' END,
+                  error=CASE WHEN error=$progressInFlight THEN NULL ELSE error END
+                  WHERE state='sending';
                 UPDATE outbox SET state='deleted' WHERE kind='text' AND expires IS NOT NULL;
                 UPDATE commands SET state=CASE WHEN readonly=1 THEN 'pending' ELSE 'unknown' END
                   WHERE state='running';
-                """);
+                """, ("$progressInFlight", ProgressSendInFlight));
             _bytes = Scalar(db, "SELECT COALESCE(SUM(bytes),0) FROM outbox WHERE path IS NOT NULL;");
             _paused = Scalar(db, "SELECT value FROM meta WHERE key='paused'") != 0;
             RecoverCaptures(db);

@@ -5,6 +5,7 @@ namespace WinSystemHelper;
 public sealed partial class QueueStore
 {
     private const string Columns = "id,chat,kind,text,path,bytes,duration,markup,state,attempts,created,due,expires,error";
+    private const string ProgressSendInFlight = "github update progress send in flight";
     private static OutboxItem Read(SqliteDataReader r) => new(r.GetString(0), r.GetInt64(1), r.GetString(2),
         r.GetString(3), r.IsDBNull(4) ? null : r.GetString(4), r.GetInt64(5), r.GetInt32(6),
         r.IsDBNull(7) ? null : r.GetString(7), r.GetString(8), r.GetInt32(9), r.GetInt64(10), r.GetInt64(11),
@@ -164,6 +165,14 @@ public sealed partial class QueueStore
             SpaceChanged.Pulse();
         }
     }
+
+    internal Task MarkProgressSendInFlightAsync(string id) => Call(db => Exec(db,
+        "UPDATE outbox SET error=$marker WHERE id=$id AND state='sending'",
+        ("$marker", ProgressSendInFlight), ("$id", id)));
+
+    internal Task DiscardUnconfirmedProgressAsync(string id) => Call(db => Exec(db,
+        "UPDATE outbox SET state='deleted',error=NULL WHERE id=$id AND state='sending' AND error=$marker",
+        ("$marker", ProgressSendInFlight), ("$id", id)));
 
     public Task RetryLaterAsync(string id, TimeSpan delay, string error, bool permanent) => Call(db => Exec(db,
         "UPDATE outbox SET state=$state,due=$due,error=$error WHERE id=$id AND state='sending'",

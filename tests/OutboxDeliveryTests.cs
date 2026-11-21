@@ -7,6 +7,110 @@ namespace WinSystemHelper.Tests;
 
 public sealed class OutboxDeliveryTests : TestWorkspace
 {
+    private const string DownloadProgress = "⬇️ GitHub update download progress: 10%";
+
+    [Theory]
+    [InlineData(DownloadProgress, 1)]
+    [InlineData("⬇️ GitHub update download started: v1.7.1 / WinSystemHelper-ota.zip", 2)]
+    public async Task OnlyDownloadProgressIsNotRetriedAfterLosingAnAcknowledgement(string message, int deliveries)
+    {
+        using QueueStore store = Store("progress-acknowledgement");
+        var transport = new FakeTransport { LoseAcknowledgement = true };
+        using var sender = ProgressSender(store, transport);
+        await store.EnqueueTextAsync(1, message);
+
+        Assert.True(await sender.DeliverOneAsync(false, CancellationToken.None));
+        await store.ConnectedAsync();
+        await sender.DeliverOneAsync(false, CancellationToken.None);
+
+        Assert.Equal(deliveries, transport.Delivered);
+        Assert.Equal(0, (await store.SnapshotAsync()).Pending);
+    }
+
+    [Fact]
+    public async Task ShutdownDuringProgressSendDoesNotRetryThatMessage()
+    {
+        using QueueStore store = Store("progress-shutdown");
+        using var stopping = new CancellationTokenSource();
+        using var sender = ProgressSender(store, new ProgressTransport(token =>
+        {
+            stopping.Cancel();
+            token.ThrowIfCancellationRequested();
+            return Task.CompletedTask;
+        }));
+        await store.EnqueueTextAsync(1, DownloadProgress);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => sender.DeliverOneAsync(false, stopping.Token));
+
+        Assert.Null(await store.ClaimAsync(false));
+    }
+
+    [Fact]
+    public async Task RestartDoesNotReplayProgressWhoseSendWasInFlight()
+    {
+        using QueueStore store = Store("progress-in-flight");
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var sender = ProgressSender(store, new ProgressTransport(_ =>
+        {
+            started.SetResult();
+            return resume.Task;
+        }));
+        await store.EnqueueTextAsync(1, DownloadProgress);
+        Task<bool> delivery = sender.DeliverOneAsync(false, CancellationToken.None);
+
+        try
+        {
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            // Open the database as startup would while the original send cannot record its outcome.
+            using var restarted = new QueueStore(store.Root, () => 512);
+            Assert.Null(await restarted.ClaimAsync(false));
+        }
+        finally
+        {
+            resume.SetResult();
+            await delivery;
+        }
+    }
+
+    [Fact]
+    public async Task RestartStillRecoversProgressClaimedBeforeTheSendStarted()
+    {
+        string root;
+        using (QueueStore store = Store("progress-before-send"))
+        {
+            root = store.Root;
+            await store.EnqueueTextAsync(1, DownloadProgress);
+            Assert.NotNull(await store.ClaimAsync(false));
+        }
+
+        using var restarted = new QueueStore(root, () => 512);
+        Assert.Equal(DownloadProgress, (await restarted.ClaimAsync(false))?.Text);
+    }
+
+    [Fact]
+    public async Task ProgressStillHonorsTelegramRetryAfter()
+    {
+        using QueueStore store = Store("progress-rate-limit");
+        var transport = new FakeTransport { Error = new ApiRequestException("synthetic", 429, new ResponseParameters { RetryAfter = 30 }) };
+        using var sender = ProgressSender(store, transport);
+        await store.EnqueueTextAsync(1, DownloadProgress);
+
+        Assert.True(await sender.DeliverOneAsync(false, CancellationToken.None));
+        await store.ConnectedAsync();
+
+        Assert.Equal(1, (await store.SnapshotAsync()).Pending);
+        Assert.Null(await store.ClaimAsync(false));
+    }
+
+    private static OutboxSender ProgressSender(QueueStore store, IOutboxTransport transport) =>
+        new(store, transport, new AppConfiguration { AdminChatIds = [1] }, NullLogger<OutboxSender>.Instance);
+
+    private sealed class ProgressTransport(Func<CancellationToken, Task> send) : IOutboxTransport
+    {
+        public Task SendAsync(OutboxItem item, CancellationToken token) => send(token);
+    }
+
     [Fact(DisplayName = "Network failure retains file")]
     public async Task NetworkFailureRetainsFile()
     {

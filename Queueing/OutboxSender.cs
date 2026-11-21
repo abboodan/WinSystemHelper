@@ -75,6 +75,7 @@ public sealed class OutboxSender(QueueStore store, IOutboxTransport transport,
     {
         OutboxItem? item = await store.ClaimAsync(media);
         if (item is null) return false;
+        bool progressSendStarted = false;
         try
         {
             if (!configuration.GetEffectiveAdminChatIds().Contains(item.ChatId))
@@ -90,6 +91,14 @@ public sealed class OutboxSender(QueueStore store, IOutboxTransport transport,
             }
             if (item.Expires is long expiry && expiry <= QueueStore.Now)
             { await store.CompleteAsync(item.Id); return true; }
+            if (item.Kind == QueueItemKind.Text && item.Markup is null && TelegramReplies.IsGitHubUpdateProgress(item.Text))
+            {
+                token.ThrowIfCancellationRequested();
+                // Persist immediately before sending so a restart cannot replay an unconfirmed progress message.
+                await store.MarkProgressSendInFlightAsync(item.Id);
+                token.ThrowIfCancellationRequested();
+                progressSendStarted = true;
+            }
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
             timeout.CancelAfter(media ? TimeSpan.FromMinutes(2) : TimeSpan.FromSeconds(15));
             await transport.SendAsync(item, timeout.Token);
@@ -97,7 +106,10 @@ public sealed class OutboxSender(QueueStore store, IOutboxTransport transport,
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
-            await store.RetryLaterAsync(item.Id, TimeSpan.Zero, "network", false);
+            if (progressSendStarted)
+                await store.DiscardUnconfirmedProgressAsync(item.Id);
+            else
+                await store.RetryLaterAsync(item.Id, TimeSpan.Zero, "network", false);
             throw;
         }
         catch (Exception ex)
@@ -109,7 +121,10 @@ public sealed class OutboxSender(QueueStore store, IOutboxTransport transport,
                 : TimeSpan.FromSeconds(Math.Min(300, 2 * Math.Pow(2, Math.Min(item.Attempts, 8))));
             string category = code == 429 ? "rate-limit" : code.HasValue ? $"Telegram {code}" : "network";
             if (code == 429) Interlocked.Exchange(ref _telegramBlockedUntil, QueueStore.Now + (long)delay.TotalMilliseconds);
-            await store.RetryLaterAsync(item.Id, delay, category, permanent);
+            if (progressSendStarted && code is null && !permanent)
+                await store.DiscardUnconfirmedProgressAsync(item.Id);
+            else
+                await store.RetryLaterAsync(item.Id, delay, category, permanent);
             if (permanent) logger.LogWarning("Outbox item {Id} needs review ({Category}).", item.Id, category);
             if (!permanent)
             {
