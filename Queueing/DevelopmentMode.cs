@@ -1,87 +1,90 @@
+using System.Text;
+
 namespace WinSystemHelper;
 
 public sealed record DevelopmentGrant(
     long ChatId, long SenderId, WindowsConsoleSession Console, long ApprovedAt, CancellationToken Token);
 
-/// <summary>Holds the permission granted by the local development consent window.</summary>
+/// <summary>Holds the permission granted by development mode.</summary>
 public sealed class DevelopmentMode(string root, IWindowsSessionProcessRunner runner, Func<long, bool> isAdmin)
 {
     private readonly object _sync = new();
     private CancellationTokenSource? _lifetime;
     private DevelopmentGrant? _grant;
     private int _lastProductionCommandId = int.MinValue;
+    private readonly string _statePath = Path.Combine(root, "development-mode.state");
+    private bool _initialized;
 
     public string Name
     {
         get
         {
+            EnsureInitialized();
             lock (_sync) return _grant is { Token.IsCancellationRequested: false } ? "development" : "production";
         }
     }
 
     public DevelopmentGrant? GetGrant(long chatId, long senderId, long receivedAt)
     {
-        DevelopmentGrant? grant;
-        lock (_sync) grant = _grant;
-        return grant is not null && grant.ChatId == chatId && grant.SenderId == senderId &&
-            receivedAt >= grant.ApprovedAt && IsUsable(grant) ? grant : null;
+        EnsureInitialized();
+        lock (_sync)
+        {
+            if (_grant is null || _grant.ChatId != chatId || _grant.SenderId != senderId ||
+                receivedAt < _grant.ApprovedAt || _grant.Token.IsCancellationRequested ||
+                !isAdmin(chatId) || !isAdmin(senderId))
+            {
+                return null;
+            }
+
+            WindowsConsoleSession? currentConsole = runner.TryGetActiveConsoleSession();
+            if (currentConsole is not null && _grant.Console != currentConsole)
+            {
+                _grant = _grant with { Console = currentConsole };
+            }
+
+            return _grant;
+        }
     }
 
     public async Task<bool> EnableAsync(int commandId, long chatId, long senderId, CancellationToken cancellationToken)
     {
-        if (!isAdmin(chatId) || !isAdmin(senderId) || runner.TryGetActiveConsoleSession() is not { } console)
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureInitialized();
+        if (!isAdmin(chatId) || !isAdmin(senderId))
         {
             return false;
         }
 
-        CancellationTokenSource lifetime;
         lock (_sync)
         {
-            if (_lifetime is not null || commandId <= _lastProductionCommandId)
+            if ((_lifetime is not null && !_lifetime.IsCancellationRequested) || commandId <= _lastProductionCommandId)
             {
                 return false;
             }
 
-            lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var lifetime = new CancellationTokenSource();
             _lifetime = lifetime;
-        }
 
-        LocalRecordingSession? window = null;
-        bool activated = false;
-        try
-        {
-            window = await LocalRecordingSession.StartAsync(root, runner, lifetime.Token, console);
-            var grant = new DevelopmentGrant(chatId, senderId, console, QueueStore.Now, window.Token);
-            lock (_sync)
+            WindowsConsoleSession console = runner.TryGetActiveConsoleSession() ?? new WindowsConsoleSession(0, string.Empty);
+            var grant = new DevelopmentGrant(chatId, senderId, console, QueueStore.Now, lifetime.Token);
+            _grant = grant;
+
+            try
             {
-                if (!ReferenceEquals(_lifetime, lifetime) || !IsUsable(grant))
-                {
-                    return false;
-                }
-
-                _grant = grant;
-                activated = true;
+                Directory.CreateDirectory(root);
+                File.WriteAllText(_statePath, $"{chatId}:{senderId}:{grant.ApprovedAt}", new UTF8Encoding(false));
             }
-
-            _ = ObserveWindowAsync(window, grant, lifetime);
-            return true;
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            return false;
-        }
-        finally
-        {
-            if (!activated)
+            catch
             {
-                Release(lifetime);
-                if (window is not null) await window.DisposeAsync();
             }
         }
+
+        return await Task.FromResult(true);
     }
 
     public void Disable(int? commandId = null)
     {
+        EnsureInitialized();
         lock (_sync)
         {
             if (commandId is int id)
@@ -91,39 +94,67 @@ public sealed class DevelopmentMode(string root, IWindowsSessionProcessRunner ru
 
             _grant = null;
             _lifetime?.Cancel();
+            _lifetime?.Dispose();
             _lifetime = null;
+
+            try
+            {
+                if (File.Exists(_statePath))
+                {
+                    File.Delete(_statePath);
+                }
+            }
+            catch
+            {
+            }
         }
     }
 
-    private bool IsUsable(DevelopmentGrant grant) => !grant.Token.IsCancellationRequested &&
-        isAdmin(grant.ChatId) && isAdmin(grant.SenderId) && runner.TryGetActiveConsoleSession() == grant.Console;
-
-    private async Task ObserveWindowAsync(LocalRecordingSession window, DevelopmentGrant grant, CancellationTokenSource lifetime)
+    private void EnsureInitialized()
     {
-        try
+        if (_initialized)
         {
-            while (IsUsable(grant)) await Task.Delay(TimeSpan.FromSeconds(1), grant.Token);
+            return;
         }
-        catch (OperationCanceledException) when (grant.Token.IsCancellationRequested) { }
-        finally
-        {
-            Release(lifetime);
-            await window.DisposeAsync();
-        }
-    }
 
-    private void Release(CancellationTokenSource lifetime)
-    {
         lock (_sync)
         {
-            if (ReferenceEquals(_lifetime, lifetime))
+            if (_initialized)
             {
-                _grant = null;
-                _lifetime = null;
+                return;
             }
 
-            lifetime.Cancel();
-            lifetime.Dispose();
+            _initialized = true;
+            TryRestorePersistedState();
+        }
+    }
+
+    private void TryRestorePersistedState()
+    {
+        if (!File.Exists(_statePath))
+        {
+            return;
+        }
+
+        try
+        {
+            string text = File.ReadAllText(_statePath, Encoding.UTF8);
+            string[] parts = text.Split(':', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (parts.Length >= 3 &&
+                long.TryParse(parts[0], out long chatId) &&
+                long.TryParse(parts[1], out long senderId) &&
+                long.TryParse(parts[2], out long approvedAt) &&
+                isAdmin(chatId) &&
+                isAdmin(senderId))
+            {
+                var lifetime = new CancellationTokenSource();
+                _lifetime = lifetime;
+                WindowsConsoleSession console = runner.TryGetActiveConsoleSession() ?? new WindowsConsoleSession(0, string.Empty);
+                _grant = new DevelopmentGrant(chatId, senderId, console, approvedAt, lifetime.Token);
+            }
+        }
+        catch
+        {
         }
     }
 }

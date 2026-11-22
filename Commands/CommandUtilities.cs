@@ -7,7 +7,7 @@ internal static class CommandUtilities
 {
     internal static string GetCommandPayload(string commandText)
     {
-        int separatorIndex = commandText.IndexOf(' ');
+        int separatorIndex = commandText.IndexOfAny([' ', '\r', '\n', '\t']);
         if (separatorIndex < 0 || separatorIndex == commandText.Length - 1)
         {
             return string.Empty;

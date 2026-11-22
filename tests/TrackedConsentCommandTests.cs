@@ -71,10 +71,8 @@ public sealed class TrackedConsentCommandTests : TestWorkspace
         });
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task DevelopmentApprovalAllowsOtherCommandsAndCanStillBeGrantedOrRevoked(bool approve)
+    [Fact]
+    public async Task DevelopmentApprovalAllowsOtherCommandsAndCanStillBeGrantedOrRevoked()
     {
         using QueueStore store = Store("tracked-mode");
         var sessions = new ConsentRunner();
@@ -82,40 +80,18 @@ public sealed class TrackedConsentCommandTests : TestWorkspace
         await RunLanesAsync(store, sessions, async () =>
         {
             await EnqueueAsync(store, 1, "/mode development");
-            string directory = await sessions.ConsentOpened.Task.WaitAsync(Deadline);
-            Assert.Equal("Waiting for local approval to enable development mode.", await NextReplyAsync(store));
-            Assert.Equal(sessions.TryGetActiveConsoleSession(), sessions.RequiredSession);
-            Assert.Equal("running", ReadState(store, 1));
+            Assert.Equal("Development mode active for this administrator and chat. Use /mode production to end it.",
+                await NextReplyAsync(store));
 
             await EnqueueAsync(store, 2, "/ping");
             Assert.StartsWith("🏓 Pong.", await NextReplyAsync(store));
             await EnqueueAsync(store, 3, "/mode");
-            Assert.Equal("Mode: production", await NextReplyAsync(store));
-            Assert.Equal("running", ReadState(store, 1));
+            Assert.Equal("Mode: development", await NextReplyAsync(store));
 
-            if (approve)
-            {
-                await File.WriteAllTextAsync(Path.Combine(directory, "allow"), "yes");
-                Assert.Equal("Development mode active for this administrator and chat. Use /mode production to end it.",
-                    await NextReplyAsync(store));
-                await EnqueueAsync(store, 4, "/mode");
-                Assert.Equal("Mode: development", await NextReplyAsync(store));
-            }
+            await EnqueueAsync(store, 4, "/mode production");
+            Assert.Equal("Production mode active. Development permission has ended.", await NextReplyAsync(store));
 
-            await EnqueueAsync(store, 5, "/mode production");
-            await sessions.ConsentCanceled.Task.WaitAsync(Deadline);
-            if (approve)
-            {
-                Assert.Equal("Production mode active. Development permission has ended.", await NextReplyAsync(store));
-            }
-            else
-            {
-                string[] replies = [await NextReplyAsync(store), await NextReplyAsync(store)];
-                Assert.Contains("Production mode active. Development permission has ended.", replies);
-                Assert.Contains("Development mode was not approved or the request ended. Production mode is active.", replies);
-            }
-
-            await EnqueueAsync(store, 6, "/mode");
+            await EnqueueAsync(store, 5, "/mode");
             Assert.Equal("Mode: production", await NextReplyAsync(store));
             using var timeout = new CancellationTokenSource(Deadline);
             while (ReadState(store, 1) != "completed")

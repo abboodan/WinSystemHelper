@@ -22,6 +22,7 @@ set "STEP_COPY_README=SKIPPED"
 set "STEP_CLEAN_SYMBOLS=SKIPPED"
 set "STEP_SIZE_CHECK=SKIPPED"
 set "STEP_PACKAGE_ZIP=SKIPPED"
+set "STEP_SIGN=SKIPPED"
 set "FAILED_STEP=None"
 set "ERROR_CODE=0"
 
@@ -38,7 +39,7 @@ echo.
 
 if exist "%BUILD_LOG%" del /q "%BUILD_LOG%" 2>nul
 
-echo [1/11] Checking .NET SDK availability...
+echo [1/12] Checking .NET SDK availability...
 set "SDK_LIST=%TEMP%\winsystemhelper-sdks-%RANDOM%.tmp"
 dotnet --list-sdks > "%SDK_LIST%" 2>> "%BUILD_LOG%"
 set "LAST_STEP_CODE=!errorlevel!"
@@ -63,7 +64,7 @@ if "!SDK_LIST_SIZE!"=="0" (
 )
 set "STEP_DOTNET=OK"
 
-echo [2/11] Preparing dist folder...
+echo [2/12] Preparing dist folder...
 if exist "%DIST%" (
     rmdir /s /q "%DIST%"
     set "LAST_STEP_CODE=!errorlevel!"
@@ -86,7 +87,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 set "STEP_CLEAN=OK"
 
 echo.
-echo [3/11] Publishing WinSystemHelper framework-dependent single-file app...
+echo [3/12] Publishing WinSystemHelper framework-dependent single-file app...
 dotnet publish "%ROOT%WinSystemHelper.csproj" -c Release -r win-x64 --self-contained false /p:SelfContained=false /p:PublishSelfContained=false /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true >> "%BUILD_LOG%" 2>&1
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -98,7 +99,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 set "STEP_APP=OK"
 
 echo.
-echo [4/11] Publishing NativeAOT bootstrapper...
+echo [4/12] Publishing NativeAOT bootstrapper...
 dotnet publish "%ROOT%WinSystemHelper.Bootstrapper\WinSystemHelper.Bootstrapper.csproj" -c Release -r win-x64 >> "%BUILD_LOG%" 2>&1
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -110,7 +111,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 set "STEP_BOOTSTRAPPER=OK"
 
 echo.
-echo [5/11] Copying app publish output...
+echo [5/12] Copying app publish output...
 xcopy /y /e /i "%APP_PUBLISH%\*" "%DIST%\" >nul
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -121,7 +122,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 )
 set "STEP_COPY_APP=OK"
 
-echo [6/11] Copying bootstrapper...
+echo [6/12] Copying bootstrapper...
 copy /y "%BOOTSTRAPPER_PUBLISH%\WinSystemHelper.Bootstrapper.exe" "%DIST%\WinSystemHelper.Bootstrapper.exe" >nul
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -132,7 +133,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 )
 set "STEP_COPY_BOOTSTRAPPER=OK"
 
-echo [7/11] Copying install.ps1...
+echo [7/12] Copying install.ps1...
 copy /y "%ROOT%install.ps1" "%DIST%\install.ps1" >nul
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -143,7 +144,7 @@ if not "!LAST_STEP_CODE!"=="0" (
 )
 set "STEP_COPY_INSTALL=OK"
 
-echo [8/11] Copying README.md...
+echo [8/12] Copying README.md...
 copy /y "%ROOT%README.md" "%DIST%\README.md" >nul
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -154,11 +155,11 @@ if not "!LAST_STEP_CODE!"=="0" (
 )
 set "STEP_COPY_README=OK"
 
-echo [9/11] Removing debug symbols from dist...
+echo [9/12] Removing debug symbols from dist...
 del /q "%DIST%\*.pdb" 2>nul
 set "STEP_CLEAN_SYMBOLS=OK"
 
-echo [10/11] Checking release package size guardrails...
+echo [10/12] Checking release package size guardrails...
 set "APP_EXE_SIZE=0"
 if exist "%DIST%\WinSystemHelper.exe" for %%F in ("%DIST%\WinSystemHelper.exe") do set "APP_EXE_SIZE=%%~zF"
 if "!APP_EXE_SIZE!"=="0" (
@@ -178,7 +179,7 @@ if !APP_EXE_SIZE! GTR !MAX_APP_EXE_BYTES! (
 )
 set "STEP_SIZE_CHECK=OK"
 
-echo [11/11] Creating OTA update ZIP...
+echo [11/12] Creating OTA update ZIP...
 if not exist "%ARTIFACTS%" mkdir "%ARTIFACTS%"
 set "LAST_STEP_CODE=!errorlevel!"
 if not "!LAST_STEP_CODE!"=="0" (
@@ -217,6 +218,49 @@ if !OTA_PACKAGE_SIZE! GTR !MAX_OTA_PACKAGE_BYTES! (
 )
 set "STEP_PACKAGE_ZIP=OK"
 
+echo.
+echo [12/12] Signing OTA update package...
+set "TEMP_KEY_FILE=%ROOT%ota-signing.key"
+if "!OTA_SIGNING_KEY!"=="" (
+    if exist "!TEMP_KEY_FILE!" (
+        for /f "usebackq delims=" %%K in ("!TEMP_KEY_FILE!") do set "OTA_SIGNING_KEY=%%K"
+    )
+)
+
+if not "!OTA_SIGNING_KEY!"=="" (
+    "%DIST%\WinSystemHelper.exe" /ota-sign "%OTA_PACKAGE%" >> "%BUILD_LOG%" 2>&1
+    set "LAST_STEP_CODE=!errorlevel!"
+    if not "!LAST_STEP_CODE!"=="0" (
+        set "STEP_SIGN=FAILED"
+        set "FAILED_STEP=Sign OTA package"
+        set "ERROR_CODE=!LAST_STEP_CODE!"
+        goto :fail
+    )
+
+    "%DIST%\WinSystemHelper.exe" /ota-verify "%OTA_PACKAGE%" >> "%BUILD_LOG%" 2>&1
+    set "LAST_STEP_CODE=!errorlevel!"
+    if "!LAST_STEP_CODE!"=="3" (
+        set "STEP_SIGN=WARNING (no pinned key in build)"
+    ) else if not "!LAST_STEP_CODE!"=="0" (
+        set "STEP_SIGN=FAILED"
+        set "FAILED_STEP=Verify OTA package signature"
+        set "ERROR_CODE=!LAST_STEP_CODE!"
+        goto :fail
+    ) else (
+        "%DIST%\WinSystemHelper.exe" /ota-attachment "%OTA_PACKAGE%" >> "%BUILD_LOG%" 2>&1
+        set "LAST_STEP_CODE=!errorlevel!"
+        if not "!LAST_STEP_CODE!"=="0" (
+            set "STEP_SIGN=FAILED"
+            set "FAILED_STEP=Create Telegram update attachment"
+            set "ERROR_CODE=!LAST_STEP_CODE!"
+            goto :fail
+        )
+        set "STEP_SIGN=OK (Signed, Verified & Telegram Attachment Created)"
+    )
+) else (
+    set "STEP_SIGN=SKIPPED (no OTA_SIGNING_KEY or ota-signing.key found)"
+)
+
 goto :success
 
 :bootstrapper_fail
@@ -254,6 +298,7 @@ echo Copy README.md:          !STEP_COPY_README!
 echo Remove PDB files:        !STEP_CLEAN_SYMBOLS!
 echo Size guardrails:         !STEP_SIZE_CHECK!
 echo Create OTA ZIP:          !STEP_PACKAGE_ZIP!
+echo Sign OTA package:        !STEP_SIGN!
 echo Failed step:             !FAILED_STEP!
 echo Exit code:               !ERROR_CODE!
 echo Build log:               "%BUILD_LOG%"
@@ -276,11 +321,27 @@ if "!ERROR_CODE!"=="0" (
     if exist "%DIST%\install.ps1" for %%F in ("%DIST%\install.ps1") do echo   %%~nxF - %%~zF bytes
     if exist "%DIST%\README.md" for %%F in ("%DIST%\README.md") do echo   %%~nxF - %%~zF bytes
     if exist "%OTA_PACKAGE%" for %%F in ("%OTA_PACKAGE%") do echo   %%~nxF - %%~zF bytes
+    if exist "%OTA_PACKAGE%.sig" for %%F in ("%OTA_PACKAGE%.sig") do echo   %%~nxF - %%~zF bytes
+    if exist "%ARTIFACTS%\WinSystemHelper-ota.telegram.zip" for %%F in ("%ARTIFACTS%\WinSystemHelper-ota.telegram.zip") do echo   %%~nxF - %%~zF bytes
     echo.
     echo Dist folder:
     echo   "%DIST%"
     echo OTA update package:
     echo   "%OTA_PACKAGE%"
+    if exist "%ARTIFACTS%\WinSystemHelper-ota.telegram.zip" (
+        echo.
+        echo Telegram update attachment [ready to send]:
+        echo   "%ARTIFACTS%\WinSystemHelper-ota.telegram.zip"
+        echo Telegram caption:
+        echo   /update
+    )
+    if exist "%OTA_PACKAGE%.sig" (
+        set "SIG_CONTENT="
+        for /f "usebackq delims=" %%S in ("%OTA_PACKAGE%.sig") do set "SIG_CONTENT=%%S"
+        echo.
+        echo Alternative caption for raw ZIP:
+        echo   /update !SIG_CONTENT!
+    )
 )
 echo ============================================================
 exit /b 0

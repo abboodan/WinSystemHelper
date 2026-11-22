@@ -40,7 +40,7 @@ internal static class TelegramUpdateAttachment
             }
 
             EnsureWithinTelegramLimit(new FileInfo(temporaryPath).Length);
-            File.Move(temporaryPath, attachmentPath);
+            File.Move(temporaryPath, attachmentPath, overwrite: true);
             return attachmentPath;
         }
         finally

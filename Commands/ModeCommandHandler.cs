@@ -46,15 +46,9 @@ internal sealed class ModeCommandHandler(
             return;
         }
 
-        await reply.SendTelegramMessageOnceAsync("Waiting for local approval to enable development mode.", token);
-        await CommandBackgroundWork.TrackStartedWork(CompleteDevelopmentRequestAsync(updateId, chatId, senderId, token));
-    }
-
-    private async Task CompleteDevelopmentRequestAsync(int updateId, long chatId, long senderId, CancellationToken token)
-    {
         bool approved = await developmentMode.EnableAsync(updateId, chatId, senderId, token);
         await reply.SendTelegramMessageOnceAsync(approved
             ? "Development mode active for this administrator and chat. Use /mode production to end it."
-            : "Development mode was not approved or the request ended. Production mode is active.", token);
+            : "Development mode could not be enabled. Production mode is active.", token);
     }
 }

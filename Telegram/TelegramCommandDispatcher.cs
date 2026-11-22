@@ -35,7 +35,7 @@ internal sealed class TelegramCommandDispatcher(
             return;
         }
 
-        string command = text.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0].ToLowerInvariant();
+        string command = text.Split([' ', '\r', '\n', '\t'], StringSplitOptions.RemoveEmptyEntries)[0].ToLowerInvariant();
 
         long? previousReplyChatId = reply.CurrentChatId;
         reply.CurrentChatId = chatId;
