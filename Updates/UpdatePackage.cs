@@ -17,7 +17,7 @@ internal sealed class UpdatePackage(
 
     private const long MaxUpdatePackageBytes = 100L * 1024L * 1024L;
 
-    private const long MaxTelegramUpdateDocumentBytes = 20L * 1024L * 1024L;
+    internal const long MaxTelegramUpdateDocumentBytes = 20L * 1024L * 1024L;
 
     private const string ZipExtension = ".zip";
 
@@ -50,8 +50,10 @@ internal sealed class UpdatePackage(
                 $"Telegram returned no downloadable file path for '{document.FileName ?? document.FileId}'.");
         }
 
-        await using FileStream destination = File.Create(zipPath);
-        await botClient.DownloadFile(telegramFile, destination, timeout.Token);
+        await using (FileStream destination = File.Create(zipPath))
+        {
+            await botClient.DownloadFile(telegramFile, destination, timeout.Token);
+        }
 
         EnsureFileWithinUpdateSizeLimit(zipPath);
     }
@@ -130,7 +132,7 @@ internal sealed class UpdatePackage(
         return Encoding.ASCII.GetString(buffer, 0, read).Trim();
     }
 
-    private static async Task CopyStreamWithLimitAsync(
+    internal static async Task CopyStreamWithLimitAsync(
         Stream source,
         Stream destination,
         long maxBytes,

@@ -67,12 +67,13 @@ async Task<int> RunAsync(string[] launchArgs)
 //   /ota-keygen <private-key-file>   create a signing key pair
 //   /ota-sign <package.zip>          write <package.zip>.sig using OTA_SIGNING_KEY
 //   /ota-verify <package.zip>        exit 0 = valid, 1 = invalid, 3 = build has no pinned key
+//   /ota-attachment <package.zip>    bundle a signed package for upload to Telegram
 static int RunOtaSigningTool(string[] launchArgs)
 {
     string mode = launchArgs[0].ToLowerInvariant();
     if (launchArgs.Length != 2)
     {
-        Console.Error.WriteLine("Usage: /ota-keygen <private-key-file> | /ota-sign <package.zip> | /ota-verify <package.zip>");
+        Console.Error.WriteLine("Usage: /ota-keygen <private-key-file> | /ota-sign <package.zip> | /ota-verify <package.zip> | /ota-attachment <package.zip>");
         return 2;
     }
 
@@ -130,6 +131,12 @@ static int RunOtaSigningTool(string[] launchArgs)
                 OtaSignature.Verify(path, File.ReadAllText(signaturePath));
             Console.WriteLine(valid ? "Signature valid." : "Signature missing or invalid.");
             return valid ? 0 : 1;
+        }
+        case "/ota-attachment":
+        {
+            string attachmentPath = TelegramUpdateAttachment.Create(path);
+            Console.WriteLine($"Telegram attachment written to: {attachmentPath}");
+            return 0;
         }
         default:
             Console.Error.WriteLine("Unknown release tool command.");

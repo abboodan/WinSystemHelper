@@ -320,7 +320,13 @@ You can also check the latest available Release without updating:
 /version check
 ```
 
-Or attach a `.zip` file in Telegram with this caption:
+Download `WinSystemHelper-ota.telegram.zip` from the Release assets to send one update file in Telegram. You can also prepare it yourself with `/ota-attachment` using the release ZIP and its matching `.zip.sig` in the same folder.
+
+```powershell
+.\WinSystemHelper.exe /ota-attachment .\WinSystemHelper-ota.zip
+```
+
+Attach the generated `WinSystemHelper-ota.telegram.zip` as a file in Telegram and use the caption below. Confirm when the bot asks.
 
 ```text
 /update
@@ -328,15 +334,16 @@ Or attach a `.zip` file in Telegram with this caption:
 
 The ZIP may contain the published files directly at its root or inside one top-level folder. For the small framework-dependent package, zip the contents of `dist\`, including `WinSystemHelper.exe`, `WinSystemHelper.Bootstrapper.exe`, and `install.ps1`. The service stages and extracts the package, preserves the existing `config.json`, stops itself, copies the new files into `AppContext.BaseDirectory`, restarts the `WinSystemHelper` service, and reports the result to all configured admins on the next startup.
 
-Telegram document updates are intended for small packages only. If the ZIP is larger than the Telegram Bot API download limit, use `/update github` or `/update https://...` instead of attaching the file in Telegram.
+WinSystemHelper accepts Telegram update attachments up to 20 MiB. Use `/update github` or `/update https://...` for larger packages.
 
 ### Signed updates
 
-An update is code that runs as LocalSystem, so being able to send a command should not be enough to install one. Release packages carry a detached ECDSA P-256 signature (`WinSystemHelper-ota.zip.sig`), and a build with a pinned public key refuses any package without a valid signature, before anything is extracted:
+An update is code that runs as LocalSystem, so being able to send a command should not be enough to install one. Release packages carry a detached ECDSA P-256 signature (`WinSystemHelper-ota.zip.sig`), and a build with a pinned public key verifies the signature before extracting any installable files.
 
 - `/update github` reads the `.sig` asset from the same Release.
 - `/update https://host/file.zip` fetches `https://host/file.zip.sig`.
-- A ZIP attached in Telegram takes the signature in the caption: `/update <signature>`.
+- A ZIP prepared with `/ota-attachment` carries the release ZIP and signature together and uses the `/update` caption.
+- The original release ZIP can still be attached with its Base64 signature in the caption, `/update <signature>`.
 
 One-time setup for maintainers (and for forks, which need their own key):
 

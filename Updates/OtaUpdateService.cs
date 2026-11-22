@@ -100,9 +100,15 @@ internal sealed class OtaUpdateService(
             attempt.Stage = $"downloading Telegram document '{document.FileName ?? document.FileId}'";
             await package.DownloadTelegramUpdatePackageAsync(document, zipPath, cancellationToken);
 
-            // A Telegram attachment has no companion file: the signature travels in
-            // the caption, as "/update <signature>".
             attempt.Signature = GetCommandPayload(commandText);
+            if (OtaSignature.IsEnforced && attempt.Signature.Length == 0)
+            {
+                attempt.Stage = "reading signed Telegram update attachment";
+                string innerZipPath = Path.Combine(attempt.Root!, "attachment-package.zip");
+                attempt.Signature = await TelegramUpdateAttachment.UnpackAsync(zipPath, innerZipPath, cancellationToken);
+                attempt.ZipPath = innerZipPath;
+            }
+
             return true;
         }
 
@@ -167,7 +173,7 @@ internal sealed class OtaUpdateService(
     private async Task InstallPackageAsync(
         UpdateAttempt attempt, StagingPaths paths, CancellationToken cancellationToken)
     {
-        // Nothing from the package is extracted or executed before this check.
+        // The signed payload archive is verified before any installable files are extracted.
         attempt.Stage = "verifying update signature";
         if (OtaSignature.IsEnforced && !OtaSignature.Verify(attempt.ZipPath!, attempt.Signature))
         {

@@ -26,7 +26,7 @@ public static class OtaSignature
     /// <summary>Environment variable the release pipeline uses to pass the private key.</summary>
     public const string PrivateKeyEnvironmentVariable = "OTA_SIGNING_KEY";
 
-    private const int MaxSignatureTextLength = 512;
+    internal const int MaxSignatureTextLength = 512;
 
     public static bool IsEnforced => !string.IsNullOrWhiteSpace(PinnedPublicKey);
 

@@ -83,6 +83,15 @@ jobs:
             throw 'This build requires signed updates, but the package has no valid signature. Check the OTA_SIGNING_KEY secret against OtaSignature.PinnedPublicKey.'
           }
 
+      - name: Prepare Telegram update attachment
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:GITHUB_WORKSPACE "artifacts\WinSystemHelper-ota.zip"
+          if (Test-Path -LiteralPath "$package.sig") {
+            ./dist/WinSystemHelper.exe /ota-attachment $package
+            if ($LASTEXITCODE -ne 0) { throw 'Preparing the Telegram update attachment failed.' }
+          }
+
       - name: Upload GitHub Release assets
         shell: pwsh
         env:
@@ -91,7 +100,10 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $package = Join-Path $env:GITHUB_WORKSPACE "artifacts\WinSystemHelper-ota.zip"
           $assets = @($package)
-          if (Test-Path -LiteralPath "$package.sig") { $assets += "$package.sig" }
+          if (Test-Path -LiteralPath "$package.sig") {
+            $assets += "$package.sig"
+            $assets += [IO.Path]::ChangeExtension($package, '.telegram.zip')
+          }
           $repo = "${{ github.repository }}"
           $draft = gh release view $tag --repo $repo --json isDraft --jq '.isDraft' 2>$null
           if ($LASTEXITCODE -eq 0 -and $draft -eq 'true') {
