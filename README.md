@@ -121,7 +121,7 @@ The project uses semantic versioning in `WinSystemHelper.csproj`. Each functiona
 - Minor: new commands, configuration options, alerts, or remote-management features.
 - Major: breaking configuration changes or behavior changes that require operator action.
 
-Current version: `1.7.2`.
+Current version: `1.7.4`.
 
 ## Installation
 
@@ -379,8 +379,8 @@ The build script includes size guardrails so CI fails instead of publishing a la
 Create a release by pushing a tag:
 
 ```powershell
-git tag v1.7.2
-git push origin v1.7.2
+git tag v1.7.4
+git push origin v1.7.4
 ```
 
 For public repositories, `/update github` reads:
