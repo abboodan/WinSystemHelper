@@ -114,7 +114,7 @@ public sealed class Worker : BackgroundService
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        _developmentMode.Disable();
+        _developmentMode.Shutdown();
         _microphone.CancelMicLoop();
         _serviceStopping.Cancel();
         _powerMonitor.UnregisterWakeEventWatcher();
@@ -273,7 +273,7 @@ public sealed class Worker : BackgroundService
 
     public override void Dispose()
     {
-        _developmentMode.Disable();
+        _developmentMode.Shutdown();
         _powerMonitor.UnregisterWakeEventWatcher();
         _powerMonitor.UnregisterPowerEventWatcher();
         _microphone.CancelMicLoop();

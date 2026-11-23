@@ -82,6 +82,17 @@ public sealed class DevelopmentMode(string root, IWindowsSessionProcessRunner ru
         return await Task.FromResult(true);
     }
 
+    public void Shutdown()
+    {
+        lock (_sync)
+        {
+            _grant = null;
+            _lifetime?.Cancel();
+            _lifetime?.Dispose();
+            _lifetime = null;
+        }
+    }
+
     public void Disable(int? commandId = null)
     {
         EnsureInitialized();

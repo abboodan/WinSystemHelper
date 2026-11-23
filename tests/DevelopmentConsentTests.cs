@@ -181,4 +181,31 @@ public sealed class DevelopmentConsentTests : TestWorkspace
             }
         }
     }
+
+    [Fact(DisplayName = "Service shutdown preserves persisted development mode")]
+    public async Task ServiceShutdownPreservesPersistedDevelopmentMode()
+    {
+        using var store = Store("shutdown-preserve");
+        var console = new WindowsConsoleSession(1, "S-1-5-21-1-2-3-1001");
+        var runner = new FakeSessionRunner { ActiveConsole = console, ApproveImmediately = false };
+        var mode = new DevelopmentMode(store.Root, runner, id => id is 1 or 2);
+
+        Assert.True(await mode.EnableAsync(1, 1, 2, CancellationToken.None));
+        Assert.Equal("development", mode.Name);
+
+        // Simulate service shutdown (Worker.StopAsync / Worker.Dispose)
+        mode.Shutdown();
+
+        // Simulate service restart
+        var restartedMode = new DevelopmentMode(store.Root, runner, id => id is 1 or 2);
+        Assert.Equal("development", restartedMode.Name);
+        Assert.NotNull(restartedMode.GetGrant(1, 2, QueueStore.Now));
+
+        // When user explicitly disables it via /mode production
+        restartedMode.Disable(2);
+        Assert.Equal("production", restartedMode.Name);
+
+        var finalMode = new DevelopmentMode(store.Root, runner, id => id is 1 or 2);
+        Assert.Equal("production", finalMode.Name);
+    }
 }
