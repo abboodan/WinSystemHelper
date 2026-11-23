@@ -1,426 +1,302 @@
-# WinSystemHelper: A Hybrid .NET 8 Windows Service for Remote System Management via Telegram
+# WinSystemHelper
 
-WinSystemHelper is a personal Windows device management utility built as a hybrid .NET 8 executable. The same binary can run as an interactive setup tool, a silent installer/uninstaller, or a long-running Windows Worker Service controlled through a private Telegram bot.
+![WinSystemHelper Hero Banner](docs/assets/hero_banner.jpg)
 
-## Features
+<p align="center">
+  <a href="https://github.com/abboodan/WinSystemHelper/releases"><img src="https://img.shields.io/github/v/release/abboodan/WinSystemHelper?color=0088cc&style=flat-square" alt="GitHub Release"></a>
+  <img src="https://img.shields.io/badge/.NET-8.0%20LTS-512bd4?style=flat-square" alt=".NET 8">
+  <img src="https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078d4?style=flat-square" alt="Platform Windows">
+  <img src="https://img.shields.io/badge/Architecture-x64-blue?style=flat-square" alt="x64 Architecture">
+  <img src="https://img.shields.io/badge/Controlled%20Via-Telegram%20Bot-24A1DE?style=flat-square&logo=telegram" alt="Telegram">
+  <img src="https://img.shields.io/badge/Security-ECDSA%20P--256-green?style=flat-square" alt="ECDSA Signed">
+</p>
 
-- Hybrid self-installing executable with interactive setup, silent install, silent uninstall, and Windows Service modes.
-- Small framework-dependent app package with a NativeAOT bootstrapper that installs missing .NET 8 runtime prerequisites.
-- Telegram Bot integration for authenticated remote administration.
-- Multi-admin command handling using the configured Telegram chat ID allowlist.
-- First-run setup wizard for interactive configuration when `config.json` is missing.
-- Startup and wake-from-sleep alerts.
-- Shutdown, restart, and sleep transition alerts with a persistent next-boot outbox.
-- Modern Standby-compatible wake detection through the Windows System event log.
-- Fail-fast Telegram configuration validation to avoid endless retries on invalid credentials.
-- Resilient Telegram polling with exponential backoff and strict network timeouts.
-- Session 0-aware command execution for workstation lock and alert sound behavior using active-user-session process launching.
-- Interactive active-user prompts using Base64-encoded PowerShell UI scripts.
-- Overt active-alarm microphone recording with local visual/audio warnings.
-- Persistent command and delivery queues, offline media capture up to a configurable quota, and a visible local recording consent/stop window.
-- Admin-only OTA self-update from a Telegram ZIP document or HTTPS ZIP URL.
-- GitHub Release-based OTA updates with `/update github` for public repositories.
-- Confirmation gates and cooldowns for dangerous remote commands.
-- Lightweight health, network, service, disk, battery, and public-IP monitoring without WMI-heavy polling.
-- Runtime configuration and admin management through Telegram without reinstalling the service.
-- Emoji-rich Telegram responses with a native Telegram command menu.
-- Local configuration through `config.json` stored beside the executable.
+---
 
-## Available Commands
+## 📌 Overview
 
-| Command | Description |
-| --- | --- |
-| `/menu` | Opens the interactive command menu in the current chat. |
-| `/status` | Shows the full low-overhead system, runtime, service, battery, and wake watcher dashboard. |
-| `/mode [production\|development]` | Shows the operating mode or asks to change it. |
-| `/healthcheck` | Shows a fast health summary with cached state and recent failures. |
-| `/log [lines]` | Shows the latest service log lines (default 40, up to 200). |
-| `/log file` | Sends the service log as a file. |
-| `/version` | Shows the installed WinSystemHelper version. |
-| `/version check` | Checks the latest GitHub Release version and reports whether an update is available. |
-| `/ping` | Returns a lightweight online response with machine name and timestamp. |
-| `/confirm [Id]` | Confirms a pending dangerous command. |
-| `/cancel [Id]` | Cancels a pending dangerous command. |
-| `/lock` | Locks the active Windows workstation. |
-| `/shutdown` | Requests confirmation before graceful shutdown after 10 seconds. |
-| `/restart` | Requests confirmation before system restart after 10 seconds. |
-| `/sleep` | Requests confirmation before putting the workstation to sleep. |
-| `/ip` | Returns the cached public IP or refreshes it with a short timeout. |
-| `/ip refresh` | Forces a public IP refresh subject to timeout and backoff. |
-| `/net` | Shows active local adapters, local IPs, gateways, DNS, and cached public IP. |
-| `/alarm` | Plays a system alert sound through the active user session. |
-| `/mic [seconds]` | Triggers an overt active alarm and returns an audio recording. |
-| `/mic [seconds] loop` | Starts a persistent overt active alarm loop. |
-| `/mic stop` | Stops recording; queued media continues uploading. |
-| `/queue` | Shows storage usage, pending commands, and failed delivery IDs. |
-| `/queue retry [Id]` | Retries a failed, completed file or message belonging to the requester. |
-| `/queue delete [Id]` | Requests confirmation before deleting a queued item. |
-| `/msg [text]` | Shows a warning message on the active user's screen. |
-| `/ask [text]` | Shows a Yes/No question and returns the user's answer. |
-| `/prompt [text]` | Forces a text response from the active user and returns it to Telegram. |
-| `/speak [text]` | Speaks a message through the active user session. |
-| `/screen` | Captures the active user's primary screen and returns the image. |
-| `/cam` | Shows overt local warnings, captures one camera photo if available, and returns it. |
-| `/tasks` | Lists the top memory-consuming processes. |
-| `/kill [ProcessName]` | Terminates matching process instances by name. |
-| `/startup` | Lists startup applications from machine and active-user registry run keys. |
-| `/restartapp [ProcessName]` | Restarts a target app in the active user's visible session. |
-| `/services` | Lists Windows services. |
-| `/service status\|start\|stop\|restart [ServiceName]` | Queries or manages a Windows service. |
-| `/config` | Shows safe runtime configuration without exposing the bot token. |
-| `/config export` | Shows a safe `config.json` preview without exposing the bot token. |
-| `/config alerts on\|off` | Enables or disables smart alerts. |
-| `/config set [Key] [Value]` | Updates runtime configuration in `config.json`. |
-| `/config admins` | Lists configured Telegram admins. |
-| `/config admin add\|remove [ChatId]` | Adds or removes Telegram admins without reinstalling. |
-| `/update [https-url]` | Applies an OTA update from an attached ZIP document or HTTPS ZIP URL. |
-| `/update github` | Downloads and applies the latest GitHub Release OTA package. |
-| `/restartself` | Requests confirmation before restarting the WinSystemHelper service. |
-| `/repair` | Runs diagnostics, safe repairs, command-menu registration, and temp cleanup. |
-| `/reinstall` | Requests confirmation before recreating the Windows Service from the current executable. |
-| `/rollback` | Requests confirmation before restoring the previous persistent OTA backup. |
-| `/help` | Shows the available remote commands. |
-| `/stop` | Requests confirmation before stopping the WinSystemHelper service. |
-| `/uninstall` | Requests confirmation before stopping and deleting the WinSystemHelper service. |
+**WinSystemHelper** is an enterprise-grade, lightweight personal Windows system administration utility built as a hybrid **.NET 8** executable. It runs silently in the background as a high-privilege **Windows Worker Service**, enabling full, real-time remote control, hardware telemetry monitoring, media capture, process management, and over-the-air (OTA) updates of your Windows PC through a private, authenticated **Telegram Bot**.
 
-Use `/menu` to browse command categories with Telegram buttons. Status and diagnostic actions can be selected directly. Copy buttons put the displayed command on the clipboard so you can review and send it. `/help` still shows the text command reference and reply keyboard. Queue reports show recent failures first, with the reason above the item ID.
+No port-forwarding, static public IPs, or dynamic DNS setups are required. The service establishes outbound HTTPS long-polling connections to the Telegram Cloud, keeping your machine completely stealthy and protected behind NAT and hardware firewalls.
 
-## Build
+---
 
-Install the .NET 8 SDK, then create the small framework-dependent release package:
+## 🏗️ System & Communication Architecture
+
+The following diagram illustrates how commands and telemetry flow securely between your mobile phone, the Telegram Cloud, and the internal subsystems of your Windows machine:
+
+```mermaid
+flowchart LR
+    subgraph ClientLayer ["📱 Administrator Clients"]
+        Phone["📱 Smartphone\n(Telegram iOS / Android)"]
+        Desktop["💻 Telegram Desktop / Web"]
+    end
+
+    subgraph CloudLayer ["☁️ Telegram Cloud"]
+        BotAPI["🤖 Telegram Bot API\n(MTProto End-to-End TLS)"]
+    end
+
+    subgraph HostPC ["🖥️ Target Windows Machine"]
+        direction TB
+        
+        subgraph ServiceRoot ["⚙️ WinSystemHelper Service (LocalSystem)"]
+            Polling["Long Polling Engine\n(Strict Timeouts & Backoff)"]
+            Dispatcher["Command Dispatcher\n(Admin Chat ID Allowlist)"]
+            QueueEngine["Durable SQLite Queue\n(Offline Outbox & Quotas)"]
+            OtaEngine["OTA Updater Engine\n(ECDSA P-256 Signature Verify)"]
+            DevMode["Development Mode\n(Persistent Across Reboots)"]
+        end
+
+        subgraph OSInteractions ["Windows OS & Hardware Bridge"]
+            SessionRunner["Session 0 Bridge\n(Launches in Active User Desktop)"]
+            HardwareMedia["Media & Sensors\n(Webcam, Audio Mic, Speaker)"]
+            SysMetrics["System Telemetry\n(Battery, Disks, Network, IP, Logs)"]
+            PowerService["Power Monitor\n(Modern Standby, Sleep & Wake Log)"]
+        end
+    end
+
+    Phone <==>|"Encrypted Chat"| BotAPI
+    Desktop <==>|"Encrypted Chat"| BotAPI
+    BotAPI <==>|"Outbound HTTPS (No Open Inbound Ports)"| Polling
+    Polling --> Dispatcher
+    Dispatcher --> QueueEngine
+    Dispatcher --> DevMode
+    Dispatcher --> OtaEngine
+    Dispatcher --> SessionRunner
+    SessionRunner --> HardwareMedia
+    SessionRunner --> SysMetrics
+    SessionRunner --> PowerService
+    QueueEngine -.->|"Durable Outbox Upload"| BotAPI
+```
+
+---
+
+## 🔄 Command Execution & Safety Confirmation Flow
+
+Commands sent from Telegram undergo multi-tier authorization and safety validation before execution:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Admin as 📱 Telegram Administrator
+    participant TG as ☁️ Telegram Bot API
+    participant SVC as ⚙️ WinSystemHelper Service
+    participant OS as 🖥️ Windows OS Subsystem
+
+    Admin->>TG: Send Command (e.g. /snap, /status)
+    TG->>SVC: Long polling delivers update
+    Note over SVC: 1. Validate ChatId & SenderId against adminChatIds
+    alt Sender Not In Authorized Allowlist
+        SVC-->>SVC: Silently ignore & drop request
+    else Authorized Administrator
+        opt Dangerous Action (e.g. /restart, /shutdown, /update)
+            SVC-->>TG: Request confirmation: /confirm 123456
+            TG-->>Admin: Show confirmation code & expiration timer
+            Admin->>TG: /confirm 123456
+            TG->>SVC: Verify confirmation code
+        end
+        SVC->>OS: Execute action (PowerShell / Capture / API)
+        OS-->>SVC: Output / Image / Audio data
+        SVC->>SVC: Stage in durable SQLite Outbox
+        SVC->>TG: Stream response / photo / document
+        TG-->>Admin: 📸 Instant Delivery to Chat
+    end
+```
+
+---
+
+## ✨ Key Features
+
+* **Zero-Configuration Network**: No port-forwarding, UPnP, or VPNs required. Connects via outbound TLS long-polling.
+* **Hybrid Binary Architecture**: A single self-contained executable handles interactive setup, silent installation/uninstallation, or background service operation.
+* **NativeAOT Bootstrapper**: Includes a zero-dependency NativeAOT bootstrapper (`WinSystemHelper.Bootstrapper.exe`) that automatically provisions .NET 8 runtime prerequisites if missing.
+* **Zero-Touch Development Mode**: Instant activation of `/mode development` for silent automation, with persistent disk state across system reboots and service restarts.
+* **Session 0 Separation Bridge**: Executes GUI messages, screen captures, audio recording, and alerts inside the active user console desktop while the main service remains isolated as `LocalSystem`.
+* **Tamper-Proof OTA Updates**: In-place self-updating engine secured by pinned **ECDSA P-256 / SHA-256** cryptographic signatures. Updates via single `.telegram.zip` attachments or directly from GitHub Releases (`/update github`).
+* **Durable Offline Queue**: SQLite-backed storage buffers telemetry, notifications, and media during network loss, guaranteeing zero lost messages.
+* **Deep Hardware & Power Telemetry**: Monitors battery percentages, disk storage quotas, public/local IP changes, and Modern Standby sleep/wake events from the Windows System Event Log.
+* **Dangerous Action Guardrails**: Critical system operations (`/shutdown`, `/restart`, `/kill`, `/uninstall`) require timed one-time confirmation codes.
+
+---
+
+## ⚡ Quick Start & Installation
+
+### Option 1: Automatic Installer (Recommended)
+
+1. Download `WinSystemHelper.Bootstrapper.exe` from the [Latest Release](https://github.com/abboodan/WinSystemHelper/releases/latest).
+2. Open PowerShell or Command Prompt as **Administrator**.
+3. Run the bootstrapper with your Telegram Bot Token and Admin Chat ID:
 
 ```powershell
-.\build.cmd
+.\WinSystemHelper.Bootstrapper.exe /install /token "YOUR_TELEGRAM_BOT_TOKEN" /chatid 123456789
 ```
 
-The NativeAOT bootstrapper publish requires the Visual Studio **Desktop development with C++** workload because Windows NativeAOT needs the platform linker. If that workload is not installed, `install.ps1` remains available as the script-based fallback.
+> [!NOTE]
+> The bootstrapper verifies .NET 8, copies binaries to `%ProgramFiles%\WinSystemHelper`, locks permissions exclusively to `SYSTEM` and `Administrators`, creates the Windows Service, and starts it automatically.
 
-The clean release package will be under:
+### Option 2: Interactive Setup Wizard
 
-```text
-dist\
-├─ WinSystemHelper.Bootstrapper.exe
-├─ WinSystemHelper.exe
-├─ install.ps1
-└─ README.md
-```
-
-The default package is framework-dependent to keep the app small. `WinSystemHelper.Bootstrapper.exe` checks for the .NET 8 x64 Runtime, downloads it from Microsoft if missing, installs it silently, then launches `WinSystemHelper.exe`.
-
-If you need a fully self-contained package for offline deployment, publish manually with:
-
-```powershell
-dotnet publish .\WinSystemHelper.csproj -c Release -r win-x64 --self-contained true /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true
-```
-
-## Versioning
-
-The project uses semantic versioning in `WinSystemHelper.csproj`. Each functional change should bump the version according to impact:
-
-- Patch: small fixes and low-risk internal corrections.
-- Minor: new commands, configuration options, alerts, or remote-management features.
-- Major: breaking configuration changes or behavior changes that require operator action.
-
-Current version: `1.7.4`.
-
-## Installation
-
-Run PowerShell or Command Prompt as Administrator, then install the service with your Telegram bot token and primary admin chat ID:
-
-```powershell
-.\WinSystemHelper.Bootstrapper.exe /install /token <YOUR_TOKEN> /chatid <YOUR_CHAT_ID>
-```
-
-The bootstrapper installs missing runtime prerequisites, then the installer copies the application to `%ProgramFiles%\WinSystemHelper`, writes `config.json` there using the multi-admin format, creates the `WinSystemHelper` Windows Service with a quoted executable path, and starts it automatically. The folder you launched the installer from is no longer used and can be deleted.
-
-The service runs as LocalSystem, so it must not live in a folder ordinary users can modify. A copy that is already somewhere under `%ProgramFiles%` is installed in place; anything else is relocated. `/repair` reports an install folder that non-administrators can write to.
-
-If the native bootstrapper is unavailable, use the PowerShell fallback from the same folder:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install.ps1 /install /token <YOUR_TOKEN> /chatid <YOUR_CHAT_ID>
-```
-
-The generated configuration stores the provided chat ID as an array:
-
-```json
-{
-  "botToken": "<YOUR_TOKEN>",
-  "adminChatIds": [
-    987654321
-  ]
-}
-```
-
-## Interactive Setup
-
-Run the executable without arguments from an elevated console on first run:
+If you prefer a guided CLI prompt, simply run the executable without flags from an elevated terminal:
 
 ```powershell
 .\WinSystemHelper.Bootstrapper.exe
 ```
 
-If `config.json` is missing, the app starts the first-run setup wizard, prompts for your Telegram bot token, prompts for the primary admin chat ID, optionally accepts additional admin chat IDs, saves them to `config.json`, installs the service, and starts it.
+The wizard will prompt you for your bot token and chat IDs, generate `config.json`, and start the background service.
 
-If `config.json` already exists, the executable runs normally as the Worker Service host.
+---
 
-## Uninstall
+## 📋 Command Reference
 
-Run from an elevated shell:
+Use `/menu` at any time to open interactive button menus directly inside Telegram.
 
-```powershell
-.\WinSystemHelper.Bootstrapper.exe /uninstall
+### 📊 System Dashboard & Diagnostics
+
+| Command | Arguments | Description |
+| :--- | :--- | :--- |
+| `/menu` | — | Opens interactive Telegram menu with inline buttons. |
+| `/status` | — | Detailed live dashboard: CPU, memory, uptime, battery, power watcher, and runtime state. |
+| `/healthcheck`| — | Fast health report showing recent exceptions, queue size, and connectivity. |
+| `/ping` | — | Lightweight ping returning computer name and response latency. |
+| `/ip` | `[refresh]` | Displays cached public IP or forces an immediate lookup. |
+| `/net` | — | Details active network adapters, local IPs, gateway, DNS, and subnet masks. |
+| `/version` | `[check]` | Shows installed version (`1.7.4`) or checks GitHub for available updates. |
+| `/log` | `[lines \| file]`| Reads recent service logs (e.g. `/log 50`) or sends `service.log` as a document. |
+
+### ⚡ Power & Remote Control
+
+| Command | Arguments | Description | Confirmation |
+| :--- | :--- | :--- | :---: |
+| `/lock` | — | Instantly locks the active Windows desktop workstation. | No |
+| `/sleep` | — | Puts the workstation into sleep / standby mode. | **Required** |
+| `/restart` | — | Gracefully restarts the computer with a 10s countdown. | **Required** |
+| `/shutdown` | — | Gracefully powers off the machine with a 10s countdown. | **Required** |
+| `/alarm` | — | Plays an overt alert sound through the active speaker session. | No |
+
+### 📸 Media & Surveillance
+
+| Command | Arguments | Description | Mode Restriction |
+| :--- | :--- | :--- | :---: |
+| `/screen` | — | Captures the active primary desktop screen and sends the image. | Production: Consent prompt<br>Development: Instant |
+| `/cam` | — | Captures a photo from the default connected webcam. | Production: Consent prompt<br>Development: Instant |
+| `/mic` | `[seconds] [loop]`| Records audio from default microphone (default 10s, up to 120s). | Production: Consent prompt<br>Development: Instant |
+| `/mic stop`| — | Immediately terminates an active microphone loop recording. | — |
+
+### 💬 Desktop User Interaction
+
+| Command | Arguments | Description |
+| :--- | :--- | :--- |
+| `/msg` | `<text>` | Displays a native warning message box on the active user's desktop. |
+| `/ask` | `<question>` | Shows a Yes/No modal dialog and replies to Telegram with the user's choice. |
+| `/prompt` | `<prompt>` | Opens an input prompt requiring the desktop user to type an answer. |
+| `/speak` | `<text>` | Speaks text aloud through Windows Speech Synthesis (SAPI). |
+
+### 🛠️ Process & Service Management
+
+| Command | Arguments | Description |
+| :--- | :--- | :--- |
+| `/tasks` | — | Lists the top 10 memory-consuming processes. |
+| `/kill` | `<ProcessName>`| Forcefully terminates matching process instances (e.g. `/kill notepad`). |
+| `/startup` | — | Lists machine and user registry startup applications. |
+| `/services` | — | Displays status of critical background services. |
+| `/service` | `<status\|start\|stop\|restart> <Name>` | Manages a specific Windows service. |
+
+### ⚙️ Operating Modes
+
+```mermaid
+stateDiagram-v2
+    [*] --> Production: Initial Clean Install
+    Production --> Development: /mode development
+    note right of Development
+        Direct Activation (No desktop popups)
+        Persists across PC reboots & service restarts
+        Instant camera, mic, & screen captures
+    end note
+    Development --> Production: /mode production
+    note left of Production
+        Prompts desktop user for approval
+        Safe mode for everyday usage
+    end note
 ```
 
-## Configuration
+* **`/mode`**: Displays the active operating mode (`production` or `development`).
+* **`/mode development`**: Activates development mode immediately. **Maintains its state permanently** on disk across service restarts and PC reboots.
+* **`/mode production`**: Reverts the machine back to production mode.
 
-Runtime credentials are stored in:
+---
 
-```text
-config.json
+## 🚀 Over-The-Air (OTA) Updates
+
+WinSystemHelper includes an autonomous, cryptographically-verified self-updater engine.
+
+```mermaid
+flowchart TD
+    A["Initiate Update: /update or /update github"] --> B{"Source Type"}
+    B -->|"Direct GitHub Release"| C["Download Latest Release Asset\nfrom api.github.com"]
+    B -->|"Telegram Attachment"| D["Receive WinSystemHelper-ota.telegram.zip"]
+    D --> E["Unpack Inner Package & Detached .sig"]
+    C --> F["Verify Pinned ECDSA P-256 Public Key"]
+    E --> F
+    F -->|Signature Mismatch| G["❌ Reject & Log Diagnostic\n(No Code Executed)"]
+    F -->|Signature Valid| H["Stage Update in Temp Folder"]
+    H --> I["Backup Current Executable to previous/"]
+    I --> J["Spawn Detached PowerShell Updater Script"]
+    J --> K["Stop Service -> Overwrite Binaries -> Start Service"]
+    K --> L["✅ Broadcast Success Report to Admins"]
 ```
 
-It sits in the install folder and holds the bot token in clear text, so it is written with an access list limited to SYSTEM and Administrators (existing installs are tightened on the next service start). Installer logs never record command-line values.
+### Method 1: Direct from GitHub Releases (Easiest)
 
-This file is intentionally excluded from Git. Do not commit bot tokens, chat IDs, appsettings files, logs, or local build output.
-
-### Who can send commands
-
-A command is accepted only when **both** the chat and the person who sent it are in `adminChatIds`. In a private chat those are the same number. If you list a group, also list the user ID of each person allowed to control the machine; other group members and anonymous group admins are ignored. Alerts are still delivered to every listed chat.
-
-The current configuration format supports multiple Telegram admins:
-
-```json
-{
-  "botToken": "<YOUR_TOKEN>",
-  "adminChatIds": [
-    111111111,
-    222222222
-  ]
-}
-```
-
-Older single-admin `adminChatId` configurations are still accepted for compatibility, but new installs and the setup wizard write `adminChatIds`.
-
-Runtime settings can be changed through Telegram without reinstalling:
-
-```text
-/config set BatteryLowPercent 15
-/config set AlertsEnabled true
-/config alerts off
-/config admin add 333333333
-```
-
-Supported runtime keys include `AlertsEnabled`, `BatteryLowPercent`, `DiskLowPercent`, `HealthCheckIntervalMinutes`, `PublicIpCacheMinutes`, `PublicIpFailureBackoffMinutes`, `DangerousCommandConfirmationSeconds`, `DangerousCommandCooldownSeconds`, `MicCooldownSeconds`, and `AllowCrossAdminConfirmations`.
-
-Dangerous commands such as shutdown, restart, sleep, update, process termination, service control, stop, and uninstall require `/confirm [Id]` before execution.
-
-## Production and development modes
-
-WinSystemHelper starts in `production`. A configured Telegram administrator can request `/mode development`. One window on the active Windows desktop explains that the requesting administrator and chat can take screenshots, camera photos, and audio without separate prompts after the local user approves. The window stays visible while development is active, with an **End development mode** button.
-
-Use `/mode production`, click the button, or close the window to revoke permission. Locking, disconnecting, or signing out of that Windows session also ends it. Each activation requires fresh local approval. Development recordings stop when permission ends, and development mode starts fresh in production after a service restart.
-
-Telegram notifications and command results are available in both modes. Commands that explicitly ask the computer to show a message, play sound, or collect an answer still do so. Check the current mode with `/mode`, `/status`, or `/config`. Set `"allowDevelopmentMode": false` in the local `config.json` and restart the service to disable development requests on a device.
-
-## Power Event Alerts
-
-Shutdown, restart, and sleep commands sent through Telegram broadcast an alert before the system action starts. The service also watches the Windows System event log for local shutdown/restart requests and sleep transitions, then attempts to notify all configured admins.
-
-If the machine powers off before Telegram delivery completes, a small JSON report is stored under the shared `PowerEvents` temp folder and sent on the next service startup. Power event alerts can be controlled remotely:
-
-```text
-/config set PowerEventAlertsEnabled false
-/config set PowerEventOutboxEnabled true
-/config set PowerCommandPreDelaySeconds 3
-```
-
-## Persistent Active Alarm Mic Loop
-
-A local user must approve a recording session. A visible window remains open with a Stop button; closing it stops recording. Camera photos and screenshots also require local approval. An audible/visual notice is issued when the session starts, not for every audio chunk.
-
-With `PersistentMicLoopEnabled`, an active loop can be restored after a service restart, but **local approval is requested again**. Local Stop, closing the recording window, or `/mic stop` disables automatic resumption. The service never replays an interrupted capture command automatically.
-
-### Offline storage and delivery
-
-Completed recordings and images are durably queued in `%ProgramData%/WinSystemHelper/Queue/<bot-scope>/`, outside the repository, temporary cleanup folders, and installation directory. SQLite holds metadata only; media is streamed from separate files. Access is limited to the service and administrators, with temporary per-capture access for the active local user. A different bot uses a separate store.
-
-```text
-/config set OutboxMaxSizeMB 512
-/queue
-/queue retry <Id>
-/queue delete <Id>
-/mic stop
-```
-
-`OutboxMaxSizeMB` defaults to **512 MiB** (one unit is 1,048,576 bytes), accepts 1–65536, and can be changed without restarting. It includes completed, failed, and reserved in-progress media. Small queue metadata/control files are additional. Images reserve up to 10 MiB; a smaller configured quota cannot accept image capture. Audio reserves its uncompressed 16 kHz/16-bit mono size before recording.
-
-At capacity, production pauses without discarding existing files. An approved loop resumes below 80% usage when its next chunk fits. Lowering the quota never deletes files; raising it wakes the loop. Uploading does not block recording or the independent control lane. No compression/conversion is added. Capture failure or withdrawal of local approval stops the loop; incomplete files are retained for review/deletion, not uploaded as complete recordings.
-
-Temporary delivery failures retry with increasing delay (2 seconds to 5 minutes). Telegram rate-limit deadlines are respected. Permanent errors appear in `/queue`; they do not block unrelated messages. Acknowledged files are deleted only after success is stored. If Telegram accepted a file but its acknowledgement was lost, a retry can produce a duplicate bearing the same capture ID and original timestamp.
-
-### Command recovery
-
-Authorized commands are saved before advancing Telegram's polling offset. Time-sensitive commands older than five minutes are rejected; read-only requests, `/mic stop`, and `/cancel` remain valid. Pending confirmations expire and are invalidated on service restart. Commands interrupted during a possible side effect are reported as having an unknown outcome and are not automatically repeated. Read-only interrupted work can be retried.
-
-The command queue holds up to 1000 active entries (50 reserved for control), and the text queue up to 2000 entries (100 reserved for control replies). At ordinary capacity, new work is rejected with a coalesced notice. Completed history is pruned incrementally after 24 hours and bounded to 10000 rows per history table. Metadata remains bounded independently of media; retention cleanup does not discard undelivered files.
-
-Legacy power/update notices are imported idempotently. The old active-loop marker is moved into private storage. Repair and OTA operations do not remove the durable queue. Keep the store when updating; if storage initialization fails, the service stops rather than resetting the queue.
-
-### Validation and public publishing
-
-```powershell
-dotnet test tests/Queue.Tests.csproj -c Release
-dotnet run --project tests/Queue.Tests.csproj -c Release -- --benchmark
-powershell -NoProfile -File tests/PublishSafety.Tests.ps1
-powershell -NoProfile -File scripts/Check-PublishSafety.ps1 -Mode WorkingTree
-powershell -NoProfile -File scripts/Check-PublishSafety.ps1 -Mode Index
-powershell -NoProfile -File scripts/Check-PublishSafety.ps1 -Mode History
-```
-
-Tests use synthetic media and fake Telegram/session transports; they do not activate hardware or send messages. `/queue-storage-check` on the published executable checks bundled SQLite without installing or starting the service. See [queue validation](docs/queue-validation.md) for measurements and remaining interactive checks.
-
-The publishing helper checks staged content and history, printing only file locations and categories for potential secrets. Failed inspection blocks publication. Release CI enforces the four-file package allowlist. Runtime configs, media, logs, database files, keys, and local build products must stay untracked. Author identity and license attribution are intentionally public. Pattern checks supplement, rather than replace, review of the final diff and files being pushed.
-
-## OTA Self-Update
-
-Authorized admins can update an endpoint remotely with a ZIP package:
-
-```text
-/update https://example.com/update.zip
-```
-
-For a public GitHub repository with Releases enabled, admins can update from the latest GitHub Release:
+Simply send the following command to your bot:
 
 ```text
 /update github
 ```
 
-The default GitHub Release settings are:
+Confirm the generated code with `/confirm [Id]`. The service will download `WinSystemHelper-ota.zip`, verify its cryptographic signature, replace the files, and restart automatically.
 
-```json
-{
-  "gitHubOwner": "abboodan",
-  "gitHubRepo": "WinSystemHelper",
-  "gitHubReleaseAssetName": "WinSystemHelper-ota.zip"
-}
-```
+### Method 2: Single-File Telegram Attachment
 
-These can be changed remotely without reinstalling:
+1. Download or build `WinSystemHelper-ota.telegram.zip`.
+2. Attach it to your chat with the bot as a **Document/File**.
+3. In the caption, write:
+   ```text
+   /update
+   ```
+4. Confirm when prompted.
 
-```text
-/config set GitHubOwner abboodan
-/config set GitHubRepo WinSystemHelper
-/config set GitHubReleaseAssetName WinSystemHelper-ota.zip
-```
+---
 
-You can also check the latest available Release without updating:
+## 🔒 Security Model & Defense-in-Depth
 
-```text
-/version check
-```
+| Security Vector | Implementation Detail |
+| :--- | :--- |
+| **No Inbound Exposure** | Does not listen on any local or public TCP/UDP ports. All communication is strictly outbound TLS polling to official Telegram servers. |
+| **Dual Admin Allowlist** | Every update must pass validation for **both** `ChatId` and `SenderId` in `adminChatIds`. Unauthorized messages are dropped silently. |
+| **Filesystem Hardening** | Program files and `config.json` receive explicit Windows Access Control Lists (ACLs) restricted to `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators`. |
+| **Session 0 Sandboxing** | Main service executes as `LocalSystem`. Interactive tasks launch via token duplication into the logged-in desktop session only when authorized. |
+| **Signed OTA Binaries** | Update archives require valid ECDSA signatures pinned to the maintainer's public key; tampered or unverified packages are rejected before extraction. |
 
-Download `WinSystemHelper-ota.telegram.zip` from the Release assets to send one update file in Telegram. You can also prepare it yourself with `/ota-attachment` using the release ZIP and its matching `.zip.sig` in the same folder.
+---
 
-```powershell
-.\WinSystemHelper.exe /ota-attachment .\WinSystemHelper-ota.zip
-```
+## 💻 Building from Source
 
-Attach the generated `WinSystemHelper-ota.telegram.zip` as a file in Telegram and use the caption below. Confirm when the bot asks.
+Prerequisites: [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0) and Visual Studio C++ Desktop workload (for NativeAOT bootstrapper compilation).
 
-```text
-/update
-```
-
-The ZIP may contain the published files directly at its root or inside one top-level folder. For the small framework-dependent package, zip the contents of `dist\`, including `WinSystemHelper.exe`, `WinSystemHelper.Bootstrapper.exe`, and `install.ps1`. The service stages and extracts the package, preserves the existing `config.json`, stops itself, copies the new files into `AppContext.BaseDirectory`, restarts the `WinSystemHelper` service, and reports the result to all configured admins on the next startup.
-
-WinSystemHelper accepts Telegram update attachments up to 20 MiB. Use `/update github` or `/update https://...` for larger packages.
-
-### Signed updates
-
-An update is code that runs as LocalSystem, so being able to send a command should not be enough to install one. Release packages carry a detached ECDSA P-256 signature (`WinSystemHelper-ota.zip.sig`), and a build with a pinned public key verifies the signature before extracting any installable files.
-
-- `/update github` reads the `.sig` asset from the same Release.
-- `/update https://host/file.zip` fetches `https://host/file.zip.sig`.
-- A ZIP prepared with `/ota-attachment` carries the release ZIP and signature together and uses the `/update` caption.
-- The original release ZIP can still be attached with its Base64 signature in the caption, `/update <signature>`.
-
-One-time setup for maintainers (and for forks, which need their own key):
+To run a full release build, package, sign, and verify the output:
 
 ```powershell
-.\WinSystemHelper.exe /ota-keygen C:\secure\ota-signing.key
+.\build.cmd
 ```
 
-Store the file's content as the GitHub Actions secret `OTA_SIGNING_KEY`, keep the file out of the repository, and set `OtaSignature.PinnedPublicKey` in `Updates/OtaSignature.cs` to the printed public key. From then on the release workflow signs the package and fails if the signature does not match the key compiled into the build.
+The output artifacts will be placed in `dist\` and `artifacts\`:
+* `dist\WinSystemHelper.exe`: Single-file framework-dependent executable.
+* `dist\WinSystemHelper.Bootstrapper.exe`: NativeAOT self-contained installer.
+* `artifacts\WinSystemHelper-ota.zip`: Raw update package with companion `.sig`.
+* `artifacts\WinSystemHelper-ota.telegram.zip`: Combined bundle ready for Telegram upload.
 
-Until a key is pinned, the build cannot verify packages: it still accepts updates, says so in the update message and in `/repair`, and the release workflow prints a warning. Rotating the key requires shipping a release, signed with the old key, that pins the new one.
+---
 
-Admin-chat authorization, confirmation, and cooldown still apply on top of the signature. The updater creates a temporary backup before copying files and refreshes a persistent `Backups\previous` copy that `/rollback` can use later. If an update copy fails, the updater still attempts immediate rollback from the temporary backup.
+## 📄 License
 
-## Maintenance
-
-WinSystemHelper includes admin-only maintenance commands for service recovery:
-
-```text
-/repair
-/restartself
-/reinstall
-/rollback
-```
-
-`/repair` is non-destructive: it validates configuration, service path, runtime availability, shared folders, Telegram command menu registration, and cleans old temporary maintenance/update artifacts. `/restartself`, `/reinstall`, and `/rollback` require confirmation and run through detached maintenance scripts so the service can stop itself safely and report the result on startup.
-
-### GitHub Releases
-
-The repository includes a GitHub Actions workflow that runs when a tag beginning with `v` is pushed. It builds the framework-dependent release package, creates `artifacts\WinSystemHelper-ota.zip`, publishes a GitHub Release, and uploads the ZIP as a Release asset.
-
-The build script includes size guardrails so CI fails instead of publishing a large self-contained `WinSystemHelper.exe` by accident.
-
-Create a release by pushing a tag:
-
-```powershell
-git tag v1.7.4
-git push origin v1.7.4
-```
-
-For public repositories, `/update github` reads:
-
-```text
-https://api.github.com/repos/abboodan/WinSystemHelper/releases/latest
-```
-
-Then it downloads the configured `WinSystemHelper-ota.zip` asset and passes it through the same OTA safety checks and confirmation flow as manual ZIP/URL updates.
-
-### OTA Safety Checks
-
-Before stopping the service, `/update` verifies that the endpoint is safe to restart:
-
-- `config.json` must exist beside the currently running service executable and contain a bot token plus at least one admin chat ID.
-- The Windows Service `binPath` must match the currently running `WinSystemHelper.exe`.
-- The service must not be running from a build output folder such as `bin\Debug` or `bin\Release`; install from a clean deployment folder first.
-- The .NET 8 x64 Runtime must be installed because the default package is framework-dependent.
-- The ZIP must contain a non-empty `WinSystemHelper.exe` at the payload root and must not include `config.json`.
-
-If any check fails, the bot rejects the update with a clear warning and keeps the existing service running.
-
-## Diagnostics and crash recovery
-
-The service keeps a rotating log in `%ProgramData%\WinSystemHelper\Service\Logs` (`service.log`, 1 MiB per file, two older files kept). It records startup and shutdown, each command word with its chat ID, warnings, and errors with their stack traces. Command arguments are not logged, and the bot token is removed from every line.
-
-```text
-/log            latest 40 lines
-/log 120        latest 120 lines (up to 200, trimmed to fit one message)
-/log file       all retained log files as one document
-```
-
-If a background task fails, the cause is written to the log and the process exits with a failure code instead of stopping quietly. Windows then restarts the service: after 1 minute on the first failure and after 5 minutes on the second; a third failure within a day leaves it stopped, so a build that crashes on start cannot loop. The service applies this recovery policy to itself on every start, so OTA-updated installs get it too.
-
-After an abnormal stop, the next start queues a notice with the recorded error for every admin. If the queue is temporarily unavailable or full, the service retains the notice and retries. A normal stop, restart, update, or Windows shutdown produces no notice. If private log storage cannot be opened at startup, file logging and crash notices are disabled for that run.
-
-## Service storage
-
-Updater and maintenance scripts, staged update payloads, the rollback backup, and pending power-event reports live under `%ProgramData%\WinSystemHelper\Service`, restricted to SYSTEM and Administrators. Earlier versions used `C:\Users\Public\Documents\WinSystemHelper`, which any local user can modify; nothing is executed or restored from that folder any more, and it can be deleted after upgrading. Because the old rollback backup is not trusted, `/rollback` becomes available again after the first update applied by this version.
-
-## Security Disclaimer
-
-This project is intended only for personal remote management of devices you own and administer. Keep your Telegram bot token private, restrict access to your admin chat ID, and understand the operational impact of remote commands such as shutdown, stop, and uninstall before enabling the service.
+This project is licensed under the [MIT License](LICENSE).

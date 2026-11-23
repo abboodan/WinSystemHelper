@@ -66,6 +66,7 @@ appsettings.*.json
 *.jpeg
 *.png
 *.webp
+!docs/assets/*
 *.zip
 *.7z
 *.db
